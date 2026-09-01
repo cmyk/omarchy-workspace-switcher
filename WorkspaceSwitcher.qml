@@ -54,12 +54,31 @@ Item {
       name: workspace.name,
       workspace: workspace,
       focused: workspace.focused,
+      monitorName: monitor ? monitor.name : "",
       monitorX: monitor ? monitor.x : 0,
       monitorY: monitor ? monitor.y : 0,
       monitorWidth: monitor ? monitor.width : panel.width,
       monitorHeight: monitor ? monitor.height : panel.height,
       windows: windows
     }
+  }
+
+  function sameWorkspaceTopology(rows) {
+    if (rows.length !== root.workspaceRows.length) return false
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i].id !== root.workspaceRows[i].id
+          || rows[i].monitorName !== root.workspaceRows[i].monitorName)
+        return false
+    }
+    return true
+  }
+
+  function screenForMonitorName(name) {
+    var screens = Quickshell.screens
+    for (var i = 0; i < screens.length; i++) {
+      if (screens[i].name === name) return screens[i]
+    }
+    return panel.screen
   }
 
   function rememberWorkspace(id) {
@@ -90,7 +109,11 @@ Item {
     // Card positions are spatial and stable: workspace 1 is always before 2,
     // 2 before 3, and so on. Recent history affects selection only.
     rows.sort(function(left, right) { return left.id - right.id })
-    root.workspaceRows = rows
+    // Preserve the delegates (and therefore their captured frames) while the
+    // same occupied workspaces remain present. Replacing an array model makes
+    // ListView destroy those delegates and would discard every cached image.
+    if (!root.sameWorkspaceTopology(rows))
+      root.workspaceRows = rows
 
     if (rows.length === 0) {
       root.selectedIndex = 0
@@ -109,10 +132,23 @@ Item {
   }
 
   function focusedIndex() {
+    var focusedId = Hyprland.focusedWorkspace ? Hyprland.focusedWorkspace.id : -1
     for (var i = 0; i < workspaceRows.length; i++) {
-      if (workspaceRows[i].focused) return i
+      if (workspaceRows[i].id === focusedId) return i
     }
     return 0
+  }
+
+  function captureFocusedWorkspace() {
+    if (root.opened || !Hyprland.focusedWorkspace) return
+
+    root.rebuild()
+    var index = root.rowIndexForWorkspace(Hyprland.focusedWorkspace.id)
+    if (index < 0) return
+
+    var card = workspaceList.itemAtIndex(index)
+    if (card && typeof card.capturePreview === "function")
+      card.capturePreview()
   }
 
   function previousWorkspaceIndex(currentId) {
@@ -196,42 +232,74 @@ Item {
   }
 
   Component.onCompleted: {
+    root.rebuild()
     if (Hyprland.focusedWorkspace)
       root.rememberWorkspace(Hyprland.focusedWorkspace.id)
+    initialCaptureTimer.restart()
+  }
+
+  Timer {
+    id: captureTimer
+    interval: 300
+    repeat: false
+    onTriggered: root.captureFocusedWorkspace()
+  }
+
+  Timer {
+    id: initialCaptureTimer
+    // Screencopy contexts are initialized asynchronously. The later first
+    // capture avoids racing that setup when the shell itself has just started.
+    interval: 1500
+    repeat: false
+    onTriggered: root.captureFocusedWorkspace()
   }
 
   Connections {
     target: Hyprland
 
     function onFocusedWorkspaceChanged() {
-      if (Hyprland.focusedWorkspace)
+      if (Hyprland.focusedWorkspace) {
         root.rememberWorkspace(Hyprland.focusedWorkspace.id)
+        // Let the compositor finish switching before taking the one cached
+        // frame. Nothing is captured continuously.
+        captureTimer.restart()
+      }
     }
   }
 
   PanelWindow {
     id: panel
-    visible: root.opened
+    // Keep the surface mapped so ListView does not destroy the delegates that
+    // own our cached screencopy buffers. While closed it is transparent,
+    // unfocused, and has an empty input region.
+    visible: true
     anchors { top: true; bottom: true; left: true; right: true }
     color: "transparent"
     WlrLayershell.namespace: "reomarchy-workspace-switcher"
     WlrLayershell.layer: WlrLayer.Overlay
-    WlrLayershell.keyboardFocus: WlrKeyboardFocus.Exclusive
+    WlrLayershell.keyboardFocus: root.opened ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.None
     exclusionMode: ExclusionMode.Ignore
+    mask: Region {
+      width: root.opened ? panel.width : 0
+      height: root.opened ? panel.height : 0
+    }
 
     Rectangle {
       anchors.fill: parent
+      visible: root.opened
       color: root.scrim
     }
 
     MouseArea {
       anchors.fill: parent
+      enabled: root.opened
       onClicked: root.dismiss()
     }
 
     Item {
       id: keyCatcher
       anchors.fill: parent
+      visible: root.opened
       focus: true
 
       Keys.priority: Keys.BeforeItem
@@ -258,6 +326,7 @@ Item {
 
     Rectangle {
       id: switcher
+      visible: root.opened
       width: Math.min(panel.width - root.outerMargin * 2,
         root.workspaceRows.length * (root.cardWidth + root.cardGap) - root.cardGap + Style.space(32))
       height: root.previewHeight + root.labelHeight + Style.space(32)
@@ -286,6 +355,20 @@ Item {
           width: root.cardWidth
           height: root.previewHeight + root.labelHeight
 
+          function capturePreview() {
+            var source = root.screenForMonitorName(modelData.monitorName)
+            if (workspaceCapture.captureSource !== source)
+              workspaceCapture.captureSource = source
+
+            if (workspaceCapture.hasContent)
+              workspaceCapture.captureFrame()
+            else
+              // Starting live mode requests the first frame once the newly
+              // created screencopy context is ready. It is disabled again as
+              // soon as that frame arrives.
+              workspaceCapture.live = true
+          }
+
           Rectangle {
             id: preview
             width: parent.width
@@ -296,7 +379,21 @@ Item {
             border.color: index === root.selectedIndex ? root.selectedText : root.borderColor
             clip: true
 
+            ScreencopyView {
+              id: workspaceCapture
+              anchors.fill: parent
+              anchors.margins: preview.border.width
+              captureSource: null
+              live: false
+              paintCursor: false
+              visible: hasContent
+              onHasContentChanged: {
+                if (hasContent && live) live = false
+              }
+            }
+
             Repeater {
+              visible: !workspaceCapture.hasContent
               model: workspaceCard.modelData.windows
 
               Rectangle {
