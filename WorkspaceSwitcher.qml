@@ -10,6 +10,7 @@ Item {
   property var shell: null
   property var manifest: null
   property bool opened: false
+  property bool revealed: false
   property int selectedIndex: 0
   property var workspaceRows: []
   property var recentWorkspaceIds: []
@@ -194,22 +195,27 @@ Item {
         ? (currentIndex - 1 + root.workspaceRows.length) % root.workspaceRows.length
         : root.previousWorkspaceIndex(currentId)
       root.opened = true
+      root.revealed = false
+      revealTimer.restart()
     } else {
-      // Once visible, traversal follows the stable card layout: Tab moves one
-      // card right and Shift+Tab one card left, both wrapping at the ends.
+      // After the initial MRU selection, traversal follows the stable card
+      // layout: Tab moves right and Shift+Tab left, wrapping at the ends.
       root.select(direction)
     }
 
     workspaceList.positionViewAtIndex(root.selectedIndex, ListView.Contain)
-    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
   function close() {
     root.opened = false
+    root.revealed = false
+    revealTimer.stop()
   }
 
   function dismiss() {
     root.opened = false
+    root.revealed = false
+    revealTimer.stop()
     if (root.shell && typeof root.shell.hide === "function")
       root.shell.hide((root.manifest && root.manifest.id) || "reomarchy.workspace-switcher")
   }
@@ -246,6 +252,19 @@ Item {
   }
 
   Timer {
+    id: revealTimer
+    // A quick Command-Tab should feel like an instantaneous toggle, not flash
+    // a large overlay. Holding Command past this threshold reveals the UI.
+    interval: 180
+    repeat: false
+    onTriggered: {
+      if (!root.opened) return
+      root.revealed = true
+      Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+    }
+  }
+
+  Timer {
     id: initialCaptureTimer
     // Screencopy contexts are initialized asynchronously. The later first
     // capture avoids racing that setup when the shell itself has just started.
@@ -277,29 +296,29 @@ Item {
     color: "transparent"
     WlrLayershell.namespace: "reomarchy-workspace-switcher"
     WlrLayershell.layer: WlrLayer.Overlay
-    WlrLayershell.keyboardFocus: root.opened ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.None
+    WlrLayershell.keyboardFocus: root.revealed ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.None
     exclusionMode: ExclusionMode.Ignore
     mask: Region {
-      width: root.opened ? panel.width : 0
-      height: root.opened ? panel.height : 0
+      width: root.revealed ? panel.width : 0
+      height: root.revealed ? panel.height : 0
     }
 
     Rectangle {
       anchors.fill: parent
-      visible: root.opened
+      visible: root.revealed
       color: root.scrim
     }
 
     MouseArea {
       anchors.fill: parent
-      enabled: root.opened
+      enabled: root.revealed
       onClicked: root.dismiss()
     }
 
     Item {
       id: keyCatcher
       anchors.fill: parent
-      visible: root.opened
+      visible: root.revealed
       focus: true
 
       Keys.priority: Keys.BeforeItem
@@ -326,7 +345,7 @@ Item {
 
     Rectangle {
       id: switcher
-      visible: root.opened
+      visible: root.revealed
       width: Math.min(panel.width - root.outerMargin * 2,
         root.workspaceRows.length * (root.cardWidth + root.cardGap) - root.cardGap + Style.space(32))
       height: root.previewHeight + root.labelHeight + Style.space(32)
