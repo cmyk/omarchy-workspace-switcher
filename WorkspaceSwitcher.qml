@@ -11,6 +11,7 @@ Item {
   property var manifest: null
   property bool opened: false
   property bool revealed: false
+  property bool quickSwitchPending: false
   property int selectedIndex: 0
   property var workspaceRows: []
   property var recentWorkspaceIds: []
@@ -18,7 +19,7 @@ Item {
 
   readonly property int maxWorkspaceCount: 10
   readonly property int maxWindowsPerWorkspace: 24
-  readonly property int maxRetainedPreviewCount: 5
+  readonly property int maxRetainedPreviewCount: maxWorkspaceCount
 
   ListModel {
     id: workspaceModel
@@ -264,10 +265,18 @@ Item {
         : root.previousWorkspaceIndex(currentId)
       root.opened = true
       root.revealed = false
+      root.quickSwitchPending = true
       revealTimer.restart()
     } else {
-      // After the initial MRU selection, traversal follows the stable card
-      // layout: Tab moves right and Shift+Tab left, wrapping at the ends.
+      // The first press is reserved for a quick MRU switch. If another Tab
+      // arrives while Super is still held, begin visible traversal from the
+      // workspace the user is actually in.
+      if (root.quickSwitchPending) {
+        root.selectedIndex = root.focusedIndex()
+        root.quickSwitchPending = false
+      }
+      // Visible traversal follows the stable card layout: Tab moves right and
+      // Shift+Tab left, wrapping at the ends.
       root.select(direction)
     }
 
@@ -277,12 +286,14 @@ Item {
   function close() {
     root.opened = false
     root.revealed = false
+    root.quickSwitchPending = false
     revealTimer.stop()
   }
 
   function dismiss() {
     root.opened = false
     root.revealed = false
+    root.quickSwitchPending = false
     revealTimer.stop()
     if (root.shell && typeof root.shell.hide === "function")
       root.shell.hide((root.manifest && root.manifest.id) || "reomarchy.workspace-switcher")
@@ -327,6 +338,13 @@ Item {
     repeat: false
     onTriggered: {
       if (!root.opened) return
+      // A held invocation is navigation, not the quick-toggle gesture. Show
+      // the current workspace selected until the user presses Tab again.
+      if (root.quickSwitchPending) {
+        root.selectedIndex = root.focusedIndex()
+        root.quickSwitchPending = false
+        workspaceList.positionViewAtIndex(root.selectedIndex, ListView.Contain)
+      }
       root.revealed = true
       Qt.callLater(function() { keyCatcher.forceActiveFocus() })
     }

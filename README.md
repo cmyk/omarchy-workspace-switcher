@@ -2,10 +2,11 @@
 
 A Mac-style visual workspace switcher for Omarchy. It presents occupied
 Hyprland workspaces as cached visual previews in stable numeric positions,
-cycles first to the most-recently used workspace, then moves left or right
-through the visible cards while Command/Super is held. It activates the
-selection when the modifier is released. A quick Command-Tab switches without
-flashing the overlay; holding Command briefly reveals the visual switcher.
+uses the most-recently used workspace for a quick toggle, then moves left or
+right through stable numeric positions while Command/Super is held. It
+activates the selection when the modifier is released. A quick Command-Tab
+switches without flashing the overlay; holding Command briefly reveals the
+visual switcher with the current workspace selected.
 Mouse hover provides a subtle visual rollover without changing the keyboard
 selection, while clicking a preview activates that workspace.
 
@@ -14,11 +15,10 @@ active. The switcher never records continuously and never writes previews to
 disk. Until a workspace has been visited, its card uses a lightweight window
 layout as a fallback.
 
-To keep the always-loaded overlay bounded, it displays at most 10 occupied
-workspaces, retains previews for the 5 most recently visited workspaces, and
-uses at most 24 windows per workspace in the fallback layout. When more than
-10 workspaces are occupied, the current and most recently used workspaces take
-priority.
+To keep the always-loaded overlay bounded, it displays and retains previews for
+at most 10 occupied workspaces, and uses at most 24 windows per workspace in
+the fallback layout. When more than 10 workspaces are occupied, the current and
+most recently used workspaces take priority.
 
 ![Workspace switcher showing five workspace previews](preview.png)
 
@@ -77,7 +77,7 @@ layout, and approximately how many occupied workspaces you had.
 
 Workspace previews are captured only after a workspace becomes active. They
 are kept in memory, are never continuously recorded, and are never written to
-disk by the plugin. At most five preview frames are retained at once.
+disk by the plugin. At most 10 preview frames are retained at once.
 
 ## License
 
