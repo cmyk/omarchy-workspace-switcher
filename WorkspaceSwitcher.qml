@@ -13,6 +13,8 @@ Item {
   property int selectedIndex: 0
   property var workspaceRows: []
   property var recentWorkspaceIds: []
+  property var cycleWorkspaceIds: []
+  property int cycleIndex: 0
 
   property color background: Color.menu.background
   property color foreground: Color.menu.text
@@ -75,8 +77,7 @@ Item {
 
   function rebuild() {
     var values = Hyprland.workspaces.values
-    var rowsById = ({})
-    var remainingRows = []
+    var rows = []
 
     if (Hyprland.focusedWorkspace)
       root.rememberWorkspace(Hyprland.focusedWorkspace.id)
@@ -84,31 +85,13 @@ Item {
     for (var i = 0; i < values.length; i++) {
       var workspace = values[i]
       if (workspace.id > 0 && workspace.toplevels.values.length > 0) {
-        var row = root.rowForWorkspace(workspace)
-        rowsById[String(workspace.id)] = row
-        remainingRows.push(row)
+        rows.push(root.rowForWorkspace(workspace))
       }
     }
 
-    remainingRows.sort(function(left, right) { return left.id - right.id })
-
-    // The focused workspace is first, followed by workspaces in most-recently
-    // used order. Numeric order is only a fallback for workspaces that have
-    // not been visited since the shell started.
-    var rows = []
-    var included = ({})
-    for (var recentIndex = 0; recentIndex < root.recentWorkspaceIds.length; recentIndex++) {
-      var recentId = String(root.recentWorkspaceIds[recentIndex])
-      if (rowsById[recentId]) {
-        rows.push(rowsById[recentId])
-        included[recentId] = true
-      }
-    }
-    for (var rowIndex = 0; rowIndex < remainingRows.length; rowIndex++) {
-      var remainingId = String(remainingRows[rowIndex].id)
-      if (!included[remainingId]) rows.push(remainingRows[rowIndex])
-    }
-
+    // Card positions are spatial and stable: workspace 1 is always before 2,
+    // 2 before 3, and so on. Recent history affects selection only.
+    rows.sort(function(left, right) { return left.id - right.id })
     root.workspaceRows = rows
 
     if (rows.length === 0) {
@@ -120,6 +103,41 @@ Item {
     if (root.selectedIndex < 0) root.selectedIndex = 0
   }
 
+  function rowIndexForWorkspace(id) {
+    for (var i = 0; i < root.workspaceRows.length; i++) {
+      if (root.workspaceRows[i].id === id) return i
+    }
+    return -1
+  }
+
+  function buildCycleOrder() {
+    var available = ({})
+    var included = ({})
+    var order = []
+
+    for (var rowIndex = 0; rowIndex < root.workspaceRows.length; rowIndex++)
+      available[String(root.workspaceRows[rowIndex].id)] = true
+
+    for (var recentIndex = 0; recentIndex < root.recentWorkspaceIds.length; recentIndex++) {
+      var recentId = root.recentWorkspaceIds[recentIndex]
+      var key = String(recentId)
+      if (available[key] && !included[key]) {
+        order.push(recentId)
+        included[key] = true
+      }
+    }
+
+    // Preserve access to occupied workspaces not yet visited during this shell
+    // session without moving their visual cards.
+    for (var fallbackIndex = 0; fallbackIndex < root.workspaceRows.length; fallbackIndex++) {
+      var fallbackId = root.workspaceRows[fallbackIndex].id
+      var fallbackKey = String(fallbackId)
+      if (!included[fallbackKey]) order.push(fallbackId)
+    }
+
+    return order
+  }
+
   function focusedIndex() {
     for (var i = 0; i < workspaceRows.length; i++) {
       if (workspaceRows[i].focused) return i
@@ -128,8 +146,9 @@ Item {
   }
 
   function select(direction) {
-    if (workspaceRows.length < 2) return
-    root.selectedIndex = (root.selectedIndex + direction + workspaceRows.length) % workspaceRows.length
+    if (root.cycleWorkspaceIds.length < 2) return
+    root.cycleIndex = (root.cycleIndex + direction + root.cycleWorkspaceIds.length) % root.cycleWorkspaceIds.length
+    root.selectedIndex = root.rowIndexForWorkspace(root.cycleWorkspaceIds[root.cycleIndex])
     workspaceList.positionViewAtIndex(root.selectedIndex, ListView.Contain)
   }
 
@@ -149,7 +168,10 @@ Item {
 
     if (!root.opened) {
       root.rebuild()
+      if (root.workspaceRows.length === 0) return
       root.selectedIndex = root.focusedIndex()
+      root.cycleWorkspaceIds = root.buildCycleOrder()
+      root.cycleIndex = Math.max(0, root.cycleWorkspaceIds.indexOf(root.workspaceRows[root.selectedIndex].id))
       root.opened = true
     }
 
@@ -323,6 +345,7 @@ Item {
               anchors.fill: parent
               onClicked: {
                 root.selectedIndex = index
+                root.cycleIndex = root.cycleWorkspaceIds.indexOf(workspaceCard.modelData.id)
                 root.activate()
               }
             }

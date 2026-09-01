@@ -1,9 +1,9 @@
 # Omarchy Workspace Switcher
 
 A Mac-style visual workspace switcher for Omarchy. It presents occupied
-Hyprland workspaces as miniature layouts, orders them by most-recent use,
-cycles while Command/Super is held, and activates the selection when the
-modifier is released.
+Hyprland workspaces as miniature layouts in stable numeric positions, cycles
+through them by most-recent use while Command/Super is held, and activates the
+selection when the modifier is released.
 
 ## Install
 
