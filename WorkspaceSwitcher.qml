@@ -140,8 +140,46 @@ Item {
     root.retainedPreviewIds = next.slice(0, root.maxRetainedPreviewCount)
   }
 
+  function recentWorkspaceRank(id) {
+    for (var i = 0; i < root.recentWorkspaceIds.length; i++) {
+      if (root.recentWorkspaceIds[i] === id) return i
+    }
+    return root.maxWorkspaceCount
+  }
+
+  function workspaceCandidateBefore(left, right) {
+    if (left.recentRank !== right.recentRank)
+      return left.recentRank < right.recentRank
+    return left.id < right.id
+  }
+
+  function retainWorkspaceCandidate(candidates, workspace) {
+    var candidate = {
+      id: workspace.id,
+      recentRank: root.recentWorkspaceRank(workspace.id),
+      workspace: workspace
+    }
+    var insertAt = 0
+    while (insertAt < candidates.length
+           && !root.workspaceCandidateBefore(candidate, candidates[insertAt]))
+      insertAt++
+
+    if (candidates.length < root.maxWorkspaceCount) {
+      candidates.splice(insertAt, 0, candidate)
+      return
+    }
+    if (insertAt >= root.maxWorkspaceCount) return
+
+    // Replace in place so even the temporary candidate collection never
+    // exceeds maxWorkspaceCount.
+    for (var i = root.maxWorkspaceCount - 1; i > insertAt; i--)
+      candidates[i] = candidates[i - 1]
+    candidates[insertAt] = candidate
+  }
+
   function rebuild() {
     var values = Hyprland.workspaces.values
+    var candidates = []
     var rows = []
 
     if (Hyprland.focusedWorkspace)
@@ -149,38 +187,19 @@ Item {
 
     for (var i = 0; i < values.length; i++) {
       var workspace = values[i]
-      if (workspace.id > 0 && workspace.toplevels.values.length > 0) {
-        rows.push(root.rowForWorkspace(workspace))
-      }
+      if (workspace.id > 0 && workspace.toplevels.values.length > 0)
+        root.retainWorkspaceCandidate(candidates, workspace)
     }
+
+    // Produce full rows, including their window data, only after the bounded
+    // candidate set has been selected. Prefer current/recent workspaces and
+    // then the lowest numbered occupied workspaces.
+    for (var candidateIndex = 0; candidateIndex < candidates.length; candidateIndex++)
+      rows.push(root.rowForWorkspace(candidates[candidateIndex].workspace))
 
     // Card positions are spatial and stable: workspace 1 is always before 2,
-    // 2 before 3, and so on. Recent history affects selection only.
+    // 2 before 3, and so on. Sorting is limited to maxWorkspaceCount rows.
     rows.sort(function(left, right) { return left.id - right.id })
-
-    // Bound the always-loaded model. Prefer the current and recently used
-    // workspaces when more occupied workspaces exist than can be retained.
-    if (rows.length > root.maxWorkspaceCount) {
-      var rowsById = ({})
-      for (var rowIndex = 0; rowIndex < rows.length; rowIndex++)
-        rowsById[rows[rowIndex].id] = rows[rowIndex]
-
-      var limitedRows = []
-      for (var recentIndex = 0;
-           recentIndex < root.recentWorkspaceIds.length && limitedRows.length < root.maxWorkspaceCount;
-           recentIndex++) {
-        var recentRow = rowsById[root.recentWorkspaceIds[recentIndex]]
-        if (recentRow) limitedRows.push(recentRow)
-      }
-      for (var sortedIndex = 0;
-           sortedIndex < rows.length && limitedRows.length < root.maxWorkspaceCount;
-           sortedIndex++) {
-        if (limitedRows.indexOf(rows[sortedIndex]) < 0)
-          limitedRows.push(rows[sortedIndex])
-      }
-      limitedRows.sort(function(left, right) { return left.id - right.id })
-      rows = limitedRows
-    }
 
     root.syncWorkspaceModel(rows)
     root.workspaceRows = rows

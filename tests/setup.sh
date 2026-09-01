@@ -80,4 +80,41 @@ if run_install "$case_dir"; then
 fi
 ! grep -Fq -- '-- Workspace Switcher: begin' "$case_dir/config/hypr/bindings.lua" || fail "manual setup detection changed bindings"
 
+case_dir=$(new_case reversed-markers)
+bindings="$case_dir/config/hypr/bindings.lua"
+cat >> "$bindings" <<'LUA'
+-- Workspace Switcher: end
+-- content that must survive
+-- Workspace Switcher: begin
+-- trailing content that must survive
+LUA
+original=$(sha256sum "$bindings" | cut -d' ' -f1)
+if env PATH="$mock_bin:$PATH" \
+  HOME="$case_dir/home" \
+  XDG_CONFIG_HOME="$case_dir/config" \
+  MOCK_LOG="$case_dir/commands.log" \
+  "$repo_dir/uninstall.sh" --yes --keep-plugin; then
+  fail "uninstaller accepted reversed binding markers"
+fi
+unchanged=$(sha256sum "$bindings" | cut -d' ' -f1)
+[[ $original == "$unchanged" ]] || fail "uninstaller changed a file with reversed markers"
+
+case_dir=$(new_case nested-markers)
+bindings="$case_dir/config/hypr/bindings.lua"
+cat >> "$bindings" <<'LUA'
+-- Workspace Switcher: begin
+-- Workspace Switcher: begin
+-- Workspace Switcher: end
+LUA
+original=$(sha256sum "$bindings" | cut -d' ' -f1)
+if env PATH="$mock_bin:$PATH" \
+  HOME="$case_dir/home" \
+  XDG_CONFIG_HOME="$case_dir/config" \
+  MOCK_LOG="$case_dir/commands.log" \
+  "$repo_dir/uninstall.sh" --yes --keep-plugin; then
+  fail "uninstaller accepted nested binding markers"
+fi
+unchanged=$(sha256sum "$bindings" | cut -d' ' -f1)
+[[ $original == "$unchanged" ]] || fail "uninstaller changed a file with nested markers"
+
 printf 'setup tests: pass\n'
