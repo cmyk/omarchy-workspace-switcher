@@ -12,6 +12,7 @@ Item {
   property bool opened: false
   property int selectedIndex: 0
   property var workspaceRows: []
+  property var recentWorkspaceIds: []
 
   property color background: Color.menu.background
   property color foreground: Color.menu.text
@@ -61,17 +62,53 @@ Item {
     }
   }
 
+  function rememberWorkspace(id) {
+    if (id === undefined || id === null || id <= 0) return
+
+    var next = [id]
+    for (var i = 0; i < root.recentWorkspaceIds.length; i++) {
+      var existingId = root.recentWorkspaceIds[i]
+      if (existingId !== id) next.push(existingId)
+    }
+    root.recentWorkspaceIds = next
+  }
+
   function rebuild() {
     var values = Hyprland.workspaces.values
-    var rows = []
+    var rowsById = ({})
+    var remainingRows = []
+
+    if (Hyprland.focusedWorkspace)
+      root.rememberWorkspace(Hyprland.focusedWorkspace.id)
 
     for (var i = 0; i < values.length; i++) {
       var workspace = values[i]
-      if (workspace.id > 0 && workspace.toplevels.values.length > 0)
-        rows.push(root.rowForWorkspace(workspace))
+      if (workspace.id > 0 && workspace.toplevels.values.length > 0) {
+        var row = root.rowForWorkspace(workspace)
+        rowsById[String(workspace.id)] = row
+        remainingRows.push(row)
+      }
     }
 
-    rows.sort(function(left, right) { return left.id - right.id })
+    remainingRows.sort(function(left, right) { return left.id - right.id })
+
+    // The focused workspace is first, followed by workspaces in most-recently
+    // used order. Numeric order is only a fallback for workspaces that have
+    // not been visited since the shell started.
+    var rows = []
+    var included = ({})
+    for (var recentIndex = 0; recentIndex < root.recentWorkspaceIds.length; recentIndex++) {
+      var recentId = String(root.recentWorkspaceIds[recentIndex])
+      if (rowsById[recentId]) {
+        rows.push(rowsById[recentId])
+        included[recentId] = true
+      }
+    }
+    for (var rowIndex = 0; rowIndex < remainingRows.length; rowIndex++) {
+      var remainingId = String(remainingRows[rowIndex].id)
+      if (!included[remainingId]) rows.push(remainingRows[rowIndex])
+    }
+
     root.workspaceRows = rows
 
     if (rows.length === 0) {
@@ -145,6 +182,20 @@ Item {
       "hl.dsp.focus({ workspace = \"" + workspaceId + "\" })"
     ])
     root.dismiss()
+  }
+
+  Component.onCompleted: {
+    if (Hyprland.focusedWorkspace)
+      root.rememberWorkspace(Hyprland.focusedWorkspace.id)
+  }
+
+  Connections {
+    target: Hyprland
+
+    function onFocusedWorkspaceChanged() {
+      if (Hyprland.focusedWorkspace)
+        root.rememberWorkspace(Hyprland.focusedWorkspace.id)
+    }
   }
 
   PanelWindow {
@@ -270,9 +321,10 @@ Item {
 
             MouseArea {
               anchors.fill: parent
-              hoverEnabled: true
-              onEntered: root.selectedIndex = index
-              onClicked: root.activate()
+              onClicked: {
+                root.selectedIndex = index
+                root.activate()
+              }
             }
           }
 
