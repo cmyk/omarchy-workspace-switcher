@@ -2,8 +2,9 @@
 
 A Mac-style visual workspace switcher for Omarchy. It presents occupied
 Hyprland workspaces as miniature layouts in stable numeric positions, cycles
-through them by most-recent use while Command/Super is held, and activates the
-selection when the modifier is released.
+first to the most-recently used workspace, then moves left or right through the
+visible cards while Command/Super is held. It activates the selection when the
+modifier is released.
 
 ## Install
 

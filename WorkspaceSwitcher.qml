@@ -13,8 +13,6 @@ Item {
   property int selectedIndex: 0
   property var workspaceRows: []
   property var recentWorkspaceIds: []
-  property var cycleWorkspaceIds: []
-  property int cycleIndex: 0
 
   property color background: Color.menu.background
   property color foreground: Color.menu.text
@@ -110,34 +108,6 @@ Item {
     return -1
   }
 
-  function buildCycleOrder() {
-    var available = ({})
-    var included = ({})
-    var order = []
-
-    for (var rowIndex = 0; rowIndex < root.workspaceRows.length; rowIndex++)
-      available[String(root.workspaceRows[rowIndex].id)] = true
-
-    for (var recentIndex = 0; recentIndex < root.recentWorkspaceIds.length; recentIndex++) {
-      var recentId = root.recentWorkspaceIds[recentIndex]
-      var key = String(recentId)
-      if (available[key] && !included[key]) {
-        order.push(recentId)
-        included[key] = true
-      }
-    }
-
-    // Preserve access to occupied workspaces not yet visited during this shell
-    // session without moving their visual cards.
-    for (var fallbackIndex = 0; fallbackIndex < root.workspaceRows.length; fallbackIndex++) {
-      var fallbackId = root.workspaceRows[fallbackIndex].id
-      var fallbackKey = String(fallbackId)
-      if (!included[fallbackKey]) order.push(fallbackId)
-    }
-
-    return order
-  }
-
   function focusedIndex() {
     for (var i = 0; i < workspaceRows.length; i++) {
       if (workspaceRows[i].focused) return i
@@ -145,10 +115,23 @@ Item {
     return 0
   }
 
+  function previousWorkspaceIndex(currentId) {
+    for (var i = 0; i < root.recentWorkspaceIds.length; i++) {
+      var recentId = root.recentWorkspaceIds[i]
+      if (recentId !== currentId) {
+        var recentIndex = root.rowIndexForWorkspace(recentId)
+        if (recentIndex >= 0) return recentIndex
+      }
+    }
+
+    return root.workspaceRows.length > 1
+      ? (root.focusedIndex() + 1) % root.workspaceRows.length
+      : root.focusedIndex()
+  }
+
   function select(direction) {
-    if (root.cycleWorkspaceIds.length < 2) return
-    root.cycleIndex = (root.cycleIndex + direction + root.cycleWorkspaceIds.length) % root.cycleWorkspaceIds.length
-    root.selectedIndex = root.rowIndexForWorkspace(root.cycleWorkspaceIds[root.cycleIndex])
+    if (root.workspaceRows.length < 2) return
+    root.selectedIndex = (root.selectedIndex + direction + root.workspaceRows.length) % root.workspaceRows.length
     workspaceList.positionViewAtIndex(root.selectedIndex, ListView.Contain)
   }
 
@@ -169,13 +152,19 @@ Item {
     if (!root.opened) {
       root.rebuild()
       if (root.workspaceRows.length === 0) return
-      root.selectedIndex = root.focusedIndex()
-      root.cycleWorkspaceIds = root.buildCycleOrder()
-      root.cycleIndex = Math.max(0, root.cycleWorkspaceIds.indexOf(root.workspaceRows[root.selectedIndex].id))
+      var currentIndex = root.focusedIndex()
+      var currentId = root.workspaceRows[currentIndex].id
+      root.selectedIndex = direction < 0
+        ? (currentIndex - 1 + root.workspaceRows.length) % root.workspaceRows.length
+        : root.previousWorkspaceIndex(currentId)
       root.opened = true
+    } else {
+      // Once visible, traversal follows the stable card layout: Tab moves one
+      // card right and Shift+Tab one card left, both wrapping at the ends.
+      root.select(direction)
     }
 
-    root.select(direction)
+    workspaceList.positionViewAtIndex(root.selectedIndex, ListView.Contain)
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
@@ -345,7 +334,6 @@ Item {
               anchors.fill: parent
               onClicked: {
                 root.selectedIndex = index
-                root.cycleIndex = root.cycleWorkspaceIds.indexOf(workspaceCard.modelData.id)
                 root.activate()
               }
             }
