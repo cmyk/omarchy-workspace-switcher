@@ -32,52 +32,17 @@ priority.
 
 ```bash
 omarchy plugin add https://github.com/cmyk/omarchy-workspace-switcher.git --enable
+~/.config/omarchy/plugins/reomarchy.workspace-switcher/install.sh
 ```
 
-Add bindings to `~/.config/hypr/bindings.lua` or another user-loaded Lua file:
+The guided setup explains that it replaces Omarchy's immediate
+`Super+Tab`/`Super+Shift+Tab` workspace cycling, checks for an existing manual
+setup, asks for confirmation, backs up `~/.config/hypr/bindings.lua`, and adds
+only a marked loader block. It reloads Hyprland and rolls the change back if
+configuration validation fails. Pass `--yes` for non-interactive setup.
 
-```lua
-hl.unbind("SUPER + TAB")
-hl.unbind("SUPER + SHIFT + TAB")
-
-local workspace_switcher_active = false
-
-local function suspend_workspace_switcher_mouse_bindings()
-  hl.unbind("SUPER + mouse_down")
-  hl.unbind("SUPER + mouse_up")
-  hl.unbind("SUPER + mouse:272")
-  hl.unbind("SUPER + mouse:273")
-end
-
-local function restore_workspace_switcher_mouse_bindings()
-  hl.bind("SUPER + mouse_down", hl.dsp.focus({ workspace = "e+1" }), { description = "Scroll active workspace forward" })
-  hl.bind("SUPER + mouse_up", hl.dsp.focus({ workspace = "e-1" }), { description = "Scroll active workspace backward" })
-  hl.bind("SUPER + mouse:272", hl.dsp.window.drag(), { mouse = true, description = "Move window" })
-  hl.bind("SUPER + mouse:273", hl.dsp.window.resize(), { mouse = true, description = "Resize window" })
-end
-
-local function summon_workspace_switcher(direction)
-  if not workspace_switcher_active then
-    suspend_workspace_switcher_mouse_bindings()
-  end
-  workspace_switcher_active = true
-  hl.exec_cmd("omarchy-shell shell summon reomarchy.workspace-switcher '{\"direction\":" .. direction .. "}'")
-end
-
-hl.bind("SUPER + TAB", function() summon_workspace_switcher(1) end, { description = "Visual workspace switcher" })
-hl.bind("SUPER + SHIFT + TAB", function() summon_workspace_switcher(-1) end, { description = "Visual workspace switcher (reverse)" })
-
-hl.on("input.keyboard.key", function(keycode, _, state)
-  if workspace_switcher_active and state == 0 and (keycode == 133 or keycode == 134) then
-    workspace_switcher_active = false
-    restore_workspace_switcher_mouse_bindings()
-    hl.exec_cmd("omarchy-shell shell summon reomarchy.workspace-switcher '{\"commit\":true}'")
-  end
-end)
-```
-
-The stock bindings previously assigned these keys to immediate next/previous
-workspace switching.
+If you already installed the bindings documented by version 0.2.x, keep that
+manual setup or remove its old Lua block before running `install.sh`.
 
 ## Update
 
@@ -87,11 +52,13 @@ omarchy plugin update reomarchy.workspace-switcher --yes
 
 ## Remove
 
-Remove the workspace-switcher block from your Hyprland bindings, then run:
-
 ```bash
-omarchy plugin remove reomarchy.workspace-switcher --yes
+~/.config/omarchy/plugins/reomarchy.workspace-switcher/uninstall.sh
 ```
+
+The removal helper deletes only its marked loader block, backs up and validates
+the Hyprland configuration, then delegates plugin removal to Omarchy. Use
+`--keep-plugin` to remove only the managed bindings.
 
 ## Compatibility reports
 
