@@ -14,6 +14,11 @@ Item {
   property int selectedIndex: 0
   property var workspaceRows: []
   property var recentWorkspaceIds: []
+  property var retainedPreviewIds: []
+
+  readonly property int maxWorkspaceCount: 10
+  readonly property int maxWindowsPerWorkspace: 24
+  readonly property int maxRetainedPreviewCount: 5
 
   ListModel {
     id: workspaceModel
@@ -50,7 +55,7 @@ Item {
     var windows = []
     var toplevels = workspace.toplevels.values
 
-    for (var i = 0; i < toplevels.length; i++) {
+    for (var i = 0; i < Math.min(toplevels.length, root.maxWindowsPerWorkspace); i++) {
       var window = toplevels[i]
       var ipc = window.lastIpcObject || ({})
       var waylandAppId = window.wayland ? window.wayland.appId : ""
@@ -122,7 +127,16 @@ Item {
       var existingId = root.recentWorkspaceIds[i]
       if (existingId !== id) next.push(existingId)
     }
-    root.recentWorkspaceIds = next
+    root.recentWorkspaceIds = next.slice(0, root.maxWorkspaceCount)
+  }
+
+  function retainPreview(id) {
+    var next = [id]
+    for (var i = 0; i < root.retainedPreviewIds.length; i++) {
+      var existingId = root.retainedPreviewIds[i]
+      if (existingId !== id) next.push(existingId)
+    }
+    root.retainedPreviewIds = next.slice(0, root.maxRetainedPreviewCount)
   }
 
   function rebuild() {
@@ -142,6 +156,31 @@ Item {
     // Card positions are spatial and stable: workspace 1 is always before 2,
     // 2 before 3, and so on. Recent history affects selection only.
     rows.sort(function(left, right) { return left.id - right.id })
+
+    // Bound the always-loaded model. Prefer the current and recently used
+    // workspaces when more occupied workspaces exist than can be retained.
+    if (rows.length > root.maxWorkspaceCount) {
+      var rowsById = ({})
+      for (var rowIndex = 0; rowIndex < rows.length; rowIndex++)
+        rowsById[rows[rowIndex].id] = rows[rowIndex]
+
+      var limitedRows = []
+      for (var recentIndex = 0;
+           recentIndex < root.recentWorkspaceIds.length && limitedRows.length < root.maxWorkspaceCount;
+           recentIndex++) {
+        var recentRow = rowsById[root.recentWorkspaceIds[recentIndex]]
+        if (recentRow) limitedRows.push(recentRow)
+      }
+      for (var sortedIndex = 0;
+           sortedIndex < rows.length && limitedRows.length < root.maxWorkspaceCount;
+           sortedIndex++) {
+        if (limitedRows.indexOf(rows[sortedIndex]) < 0)
+          limitedRows.push(rows[sortedIndex])
+      }
+      limitedRows.sort(function(left, right) { return left.id - right.id })
+      rows = limitedRows
+    }
+
     root.syncWorkspaceModel(rows)
     root.workspaceRows = rows
 
@@ -394,10 +433,9 @@ Item {
         spacing: root.cardGap
         clip: true
         boundsBehavior: Flickable.StopAtBounds
-        // Screenshot buffers live in delegates. Cache the full strip and do
-        // not recycle delegates, otherwise offscreen previews would vanish.
-        cacheBuffer: Math.max(width,
-          root.workspaceRows.length * (root.cardWidth + root.cardGap))
+        // Keep delegate creation bounded near the visible strip. Preview
+        // retention is independently limited and evicted buffers are cleared.
+        cacheBuffer: root.maxRetainedPreviewCount * (root.cardWidth + root.cardGap)
         reuseItems: false
         model: workspaceModel
 
@@ -406,10 +444,13 @@ Item {
           required property int index
           required property var row
           readonly property bool hovered: previewMouse.containsMouse
+          readonly property bool retainPreview:
+            root.retainedPreviewIds.indexOf(row.id) >= 0
           width: root.cardWidth
           height: root.previewHeight + root.labelHeight
 
           function capturePreview() {
+            root.retainPreview(row.id)
             var source = root.screenForMonitorName(row.monitorName)
             if (workspaceCapture.captureSource !== source)
               workspaceCapture.captureSource = source
@@ -421,6 +462,13 @@ Item {
               // created screencopy context is ready. It is disabled again as
               // soon as that frame arrives.
               workspaceCapture.live = true
+          }
+
+          onRetainPreviewChanged: {
+            if (!retainPreview) {
+              workspaceCapture.live = false
+              workspaceCapture.captureSource = null
+            }
           }
 
           Rectangle {
@@ -493,6 +541,7 @@ Item {
                     anchors.fill: parent
                     anchors.margins: Style.space(6)
                     text: modelData.className
+                    textFormat: Text.PlainText
                     color: index === root.selectedIndex ? root.selectedText : root.foreground
                     font.family: Style.font.menuFamily
                     font.pixelSize: Style.font.caption
@@ -529,6 +578,7 @@ Item {
             anchors.topMargin: Style.space(10)
             anchors.horizontalCenter: parent.horizontalCenter
             text: "Workspace " + workspaceCard.row.name
+            textFormat: Text.PlainText
             color: index === root.selectedIndex || workspaceCard.hovered
               ? root.foreground
               : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.62)

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "reomarchy.workspace-switcher",
   "name": "Workspace Switcher",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "author": "cmyk",
   "license": "MIT",
   "description": "A Mac-style visual workspace switcher for Omarchy.",
