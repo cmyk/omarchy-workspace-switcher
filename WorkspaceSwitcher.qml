@@ -371,6 +371,7 @@ Item {
           id: workspaceCard
           required property int index
           required property var modelData
+          readonly property bool hovered: previewMouse.containsMouse
           width: root.cardWidth
           height: root.previewHeight + root.labelHeight
 
@@ -393,10 +394,24 @@ Item {
             width: parent.width
             height: root.previewHeight
             radius: Style.cornerRadius
-            color: index === root.selectedIndex ? root.selectedBackground : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06)
-            border.width: index === root.selectedIndex ? Style.space(3) : Math.max(1, Style.space(1))
-            border.color: index === root.selectedIndex ? root.selectedText : root.borderColor
+            scale: workspaceCard.hovered ? 1.015 : 1
+            color: index === root.selectedIndex
+              ? root.selectedBackground
+              : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b,
+                  workspaceCard.hovered ? 0.10 : 0.06)
+            border.width: index === root.selectedIndex
+              ? Style.space(3)
+              : (workspaceCard.hovered ? Style.space(2) : Math.max(1, Style.space(1)))
+            border.color: index === root.selectedIndex
+              ? root.selectedText
+              : (workspaceCard.hovered
+                  ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.72)
+                  : root.borderColor)
             clip: true
+
+            Behavior on scale {
+              NumberAnimation { duration: 90; easing.type: Easing.OutCubic }
+            }
 
             ScreencopyView {
               id: workspaceCapture
@@ -446,8 +461,20 @@ Item {
               }
             }
 
-            MouseArea {
+            Rectangle {
               anchors.fill: parent
+              anchors.margins: preview.border.width
+              radius: Math.max(0, preview.radius - preview.border.width)
+              color: workspaceCard.hovered && index !== root.selectedIndex
+                ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.055)
+                : "transparent"
+            }
+
+            MouseArea {
+              id: previewMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
               onClicked: {
                 root.selectedIndex = index
                 root.activate()
@@ -460,10 +487,12 @@ Item {
             anchors.topMargin: Style.space(10)
             anchors.horizontalCenter: parent.horizontalCenter
             text: "Workspace " + workspaceCard.modelData.name
-            color: index === root.selectedIndex ? root.foreground : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.62)
+            color: index === root.selectedIndex || workspaceCard.hovered
+              ? root.foreground
+              : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.62)
             font.family: Style.font.menuFamily
             font.pixelSize: Style.font.body
-            font.bold: index === root.selectedIndex
+            font.bold: index === root.selectedIndex || workspaceCard.hovered
           }
         }
       }

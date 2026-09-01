@@ -6,6 +6,8 @@ cycles first to the most-recently used workspace, then moves left or right
 through the visible cards while Command/Super is held. It activates the
 selection when the modifier is released. A quick Command-Tab switches without
 flashing the overlay; holding Command briefly reveals the visual switcher.
+Mouse hover provides a subtle visual rollover without changing the keyboard
+selection, while clicking a preview activates that workspace.
 
 Each workspace receives one in-memory screenshot shortly after it becomes
 active. The switcher never records continuously and never writes previews to
