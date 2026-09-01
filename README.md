@@ -14,7 +14,7 @@ active. The switcher never records continuously and never writes previews to
 disk. Until a workspace has been visited, its card uses a lightweight window
 layout as a fallback.
 
-![Workspace switcher showing five workspace previews](assets/workspace-switcher.png)
+![Workspace switcher showing five workspace previews](preview.png)
 
 > [!NOTE]
 > This is a beta release. It is currently tested on Omarchy 4.0.2 with
