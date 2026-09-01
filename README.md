@@ -17,8 +17,8 @@ hl.unbind("SUPER + TAB")
 hl.unbind("SUPER + SHIFT + TAB")
 o.bind("SUPER + TAB", "Visual workspace switcher", "omarchy-shell shell summon reomarchy.workspace-switcher '{\"direction\":1}'")
 o.bind("SUPER + SHIFT + TAB", "Visual workspace switcher (reverse)", "omarchy-shell shell summon reomarchy.workspace-switcher '{\"direction\":-1}'")
-o.bind("SUPER_L", nil, "omarchy-shell shell summon reomarchy.workspace-switcher '{\"commit\":true}'", { release = true })
-o.bind("SUPER_R", nil, "omarchy-shell shell summon reomarchy.workspace-switcher '{\"commit\":true}'", { release = true })
+o.bind("SUPER + SUPER_L", nil, "omarchy-shell shell summon reomarchy.workspace-switcher '{\"commit\":true}'", { release = true })
+o.bind("SUPER + SUPER_R", nil, "omarchy-shell shell summon reomarchy.workspace-switcher '{\"commit\":true}'", { release = true })
 ```
 
 The stock bindings previously assigned these keys to immediate next/previous
