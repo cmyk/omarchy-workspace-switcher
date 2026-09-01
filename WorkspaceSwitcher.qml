@@ -99,6 +99,15 @@ Item {
   function open(payloadJson) {
     var payload = ({})
     try { payload = JSON.parse(payloadJson || "{}") } catch (e) { payload = ({}) }
+
+    // Hyprland owns the global Command/Super binding, so it also reports the
+    // modifier release. Ignore unrelated Command releases when the switcher
+    // is closed; commit the current selection when it is open.
+    if (payload.commit === true) {
+      if (root.opened) root.activate()
+      return
+    }
+
     var direction = payload.direction === -1 ? -1 : 1
 
     if (!root.opened) {
@@ -127,9 +136,15 @@ Item {
       return
     }
 
-    var workspace = root.workspaceRows[root.selectedIndex].workspace
+    var workspaceId = root.workspaceRows[root.selectedIndex].id
+    // Omarchy runs Hyprland's Lua configuration, so dispatch the Lua helper
+    // instead of the legacy `workspace N` dispatcher.
+    Quickshell.execDetached([
+      "hyprctl",
+      "dispatch",
+      "hl.dsp.focus({ workspace = \"" + workspaceId + "\" })"
+    ])
     root.dismiss()
-    if (workspace && typeof workspace.activate === "function") workspace.activate()
   }
 
   PanelWindow {
@@ -177,12 +192,6 @@ Item {
         }
       }
 
-      Keys.onReleased: function(event) {
-        if (event.key === Qt.Key_Meta) {
-          root.activate()
-          event.accepted = true
-        }
-      }
     }
 
     Rectangle {
