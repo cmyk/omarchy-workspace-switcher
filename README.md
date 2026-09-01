@@ -14,11 +14,10 @@ active. The switcher never records continuously and never writes previews to
 disk. Until a workspace has been visited, its card uses a lightweight window
 layout as a fallback.
 
-To keep the always-loaded overlay bounded, it displays at most 10 occupied
-workspaces, retains previews for the 5 most recently visited workspaces, and
-uses at most 24 windows per workspace in the fallback layout. When more than
-10 workspaces are occupied, the current and most recently used workspaces take
-priority.
+To keep the always-loaded overlay bounded, it displays and retains previews for
+at most 10 occupied workspaces, and uses at most 24 windows per workspace in
+the fallback layout. When more than 10 workspaces are occupied, the current and
+most recently used workspaces take priority.
 
 ![Workspace switcher showing five workspace previews](preview.png)
 
@@ -77,7 +76,7 @@ layout, and approximately how many occupied workspaces you had.
 
 Workspace previews are captured only after a workspace becomes active. They
 are kept in memory, are never continuously recorded, and are never written to
-disk by the plugin. At most five preview frames are retained at once.
+disk by the plugin. At most 10 preview frames are retained at once.
 
 ## License
 

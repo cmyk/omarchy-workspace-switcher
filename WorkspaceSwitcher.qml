@@ -18,7 +18,7 @@ Item {
 
   readonly property int maxWorkspaceCount: 10
   readonly property int maxWindowsPerWorkspace: 24
-  readonly property int maxRetainedPreviewCount: 5
+  readonly property int maxRetainedPreviewCount: maxWorkspaceCount
 
   ListModel {
     id: workspaceModel
