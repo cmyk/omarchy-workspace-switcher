@@ -36,10 +36,15 @@ done
 
 if [[ -f $bindings_file ]]; then
   [[ ! -L $bindings_file ]] || fail "refusing to replace symlinked bindings file: $bindings_file"
-  begin_count=$(grep -Fc -- "$begin_marker" "$bindings_file" || true)
-  end_count=$(grep -Fc -- "$end_marker" "$bindings_file" || true)
+  read -r begin_count begin_line end_count end_line < <(
+    awk -v begin="$begin_marker" -v end="$end_marker" '
+      $0 == begin { begin_count++; begin_line = NR }
+      $0 == end { end_count++; end_line = NR }
+      END { print begin_count + 0, begin_line + 0, end_count + 0, end_line + 0 }
+    ' "$bindings_file"
+  )
 
-  if (( begin_count == 1 && end_count == 1 )); then
+  if (( begin_count == 1 && end_count == 1 && begin_line < end_line )); then
     backup=$(mktemp "${bindings_file}.bak.workspace-switcher-remove.XXXXXXXX")
     cp -p -- "$bindings_file" "$backup"
 
@@ -71,7 +76,7 @@ if [[ -f $bindings_file ]]; then
     fi
     printf 'Removed Workspace Switcher bindings. Backup: %s\n' "$backup"
   elif (( begin_count != 0 || end_count != 0 )); then
-    fail "binding markers are incomplete; refusing to edit $bindings_file"
+    fail "expected one correctly ordered binding block; refusing to edit $bindings_file"
   else
     printf 'No managed Workspace Switcher binding block found in %s.\n' "$bindings_file"
   fi
