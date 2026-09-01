@@ -53,11 +53,12 @@ Item {
     for (var i = 0; i < toplevels.length; i++) {
       var window = toplevels[i]
       var ipc = window.lastIpcObject || ({})
+      var waylandAppId = window.wayland ? window.wayland.appId : ""
       var at = ipc.at || [monitor ? monitor.x : 0, monitor ? monitor.y : 0]
       var size = ipc.size || [Style.space(300), Style.space(200)]
       windows.push({
         title: window.title || ipc.title || "Window",
-        className: root.friendlyAppName(ipc.class || "App"),
+        className: root.friendlyAppName(ipc.class || waylandAppId || "App"),
         x: at[0],
         y: at[1],
         width: size[0],
