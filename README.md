@@ -14,6 +14,14 @@ active. The switcher never records continuously and never writes previews to
 disk. Until a workspace has been visited, its card uses a lightweight window
 layout as a fallback.
 
+![Workspace switcher showing five workspace previews](assets/workspace-switcher.png)
+
+> [!NOTE]
+> This is a beta release. It is currently tested on Omarchy 4.0.2 with
+> Hyprland 0.56.2 and Quickshell 0.3.1 on a 2011 MacBook Pro. Reports from
+> other hardware, keyboards, display layouts, and Omarchy versions are very
+> welcome.
+
 ## Install
 
 ```bash
@@ -64,3 +72,40 @@ end)
 
 The stock bindings previously assigned these keys to immediate next/previous
 workspace switching.
+
+## Update
+
+```bash
+omarchy plugin update reomarchy.workspace-switcher --yes
+```
+
+## Remove
+
+Remove the workspace-switcher block from your Hyprland bindings, then run:
+
+```bash
+omarchy plugin remove reomarchy.workspace-switcher --yes
+```
+
+## Compatibility reports
+
+When reporting a problem, include the output of:
+
+```bash
+omarchy version
+hyprctl version
+quickshell --version
+```
+
+Please also mention whether you use an Apple or PC keyboard, your monitor
+layout, and approximately how many occupied workspaces you had.
+
+## Privacy
+
+Workspace previews are captured only after a workspace becomes active. They
+are kept in memory, are never continuously recorded, and are never written to
+disk by the plugin.
+
+## License
+
+[MIT](LICENSE)
