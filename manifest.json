@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "reomarchy.workspace-switcher",
+  "name": "Workspace Switcher",
+  "version": "0.1.0",
+  "author": "cmyk",
+  "license": "MIT",
+  "description": "A Mac-style visual workspace switcher for Omarchy.",
+  "kinds": ["overlay"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "WorkspaceSwitcher.qml"
+  }
+}
