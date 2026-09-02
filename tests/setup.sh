@@ -212,6 +212,33 @@ grep -Fq -- 'refusing a symlinked Hyprland config directory' "$case_dir/error.lo
 unchanged=$(sha256sum "$bindings" | cut -d' ' -f1)
 [[ $original == "$unchanged" ]] || fail "installer changed a file through a symlinked directory"
 
+case_dir=$(new_case oversize)
+bindings="$case_dir/config/hypr/bindings.lua"
+head -c 4194305 /dev/zero | tr '\0' '-' > "$bindings"
+original=$(sha256sum "$bindings" | cut -d' ' -f1)
+if run_install "$case_dir" 2> "$case_dir/error.log"; then
+  fail "installer accepted an oversized binding file"
+fi
+grep -Fq -- 'larger than' "$case_dir/error.log" || fail "oversized binding file error lacks the bound"
+unchanged=$(sha256sum "$bindings" | cut -d' ' -f1)
+[[ $original == "$unchanged" ]] || fail "installer changed an oversized binding file"
+
+case_dir=$(new_case untrusted-executable)
+bindings="$case_dir/config/hypr/bindings.lua"
+original=$(sha256sum "$bindings" | cut -d' ' -f1)
+chmod o+w "$mock_bin/hyprctl"
+if run_install "$case_dir" 2> "$case_dir/error.log"; then
+  chmod o-w "$mock_bin/hyprctl"
+  fail "installer ran a world-writable hyprctl"
+fi
+chmod o-w "$mock_bin/hyprctl"
+grep -Fq -- 'writable by other users' "$case_dir/error.log" || fail "untrusted executable error lacks guidance"
+unchanged=$(sha256sum "$bindings" | cut -d' ' -f1)
+[[ $original == "$unchanged" ]] || fail "installer changed a file with an untrusted executable"
+! grep -q 'reload' "$case_dir/commands.log" 2>/dev/null || fail "installer invoked an untrusted hyprctl"
+
+python3 "$repo_dir/tests/transaction.py"
+
 ! grep -Eq -- 'hl\.(un)?bind\("SUPER \+ mouse' "$repo_dir/bindings.lua" || fail "runtime bindings still replace Super+mouse mappings"
 if command -v lua >/dev/null 2>&1; then
   lua "$repo_dir/tests/bindings.lua" "$repo_dir/bindings.lua"
