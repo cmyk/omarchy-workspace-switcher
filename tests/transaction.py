@@ -70,8 +70,11 @@ class Case:
             elif [[ $* == 'plugin enable reomarchy.workspace-switcher' ]]; then
               [[ -e "$XDG_CONFIG_HOME/../enable-blocks" ]] && {
                 printf 'true' > "$state"
+                printf '%s' "$$" > "$XDG_CONFIG_HOME/../enable-pid"
                 : > "$XDG_CONFIG_HOME/../enable-entered"
-                sleep 300
+                # exec keeps this PID, so the test can kill exactly this
+                # process instead of matching on a command line.
+                exec sleep 300
               }
               printf 'true' > "$state"
             elif [[ $* == 'plugin disable reomarchy.workspace-switcher' ]]; then
@@ -408,7 +411,14 @@ def test_enable_window(root):
     finally:
         process.wait(timeout=30)
     os.remove(os.path.join(case.dir, "enable-blocks"))
-    subprocess.run(["/usr/bin/pkill", "-f", "sleep 300"], check=False)
+    # The blocked mock is in its own session, so killing the helper does not
+    # reach it. It recorded its own pid, which stays valid across its exec.
+    with open(os.path.join(case.dir, "enable-pid")) as handle:
+        blocked_pid = int(handle.read())
+    try:
+        os.kill(blocked_pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
     expect(case.marker_phase() == "enabling", f"during-call: phase was {case.marker_phase()}")
     expect(case.enabled(), "during-call: enable did not take effect before the kill")
     recovery = case.run_helper("check")
