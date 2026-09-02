@@ -833,9 +833,16 @@ def scan_directory(parent_fd, prefix, depth, budget, matches):
             if is_file and entry.name.endswith(".lua"):
                 scan_lua_file(parent_fd, entry.name, prefix + entry.name, budget, matches)
 
-    # Every file at this depth has been inspected before any subtree can spend
-    # the remaining budget, so a shallow manual setup is never missed because a
-    # large sibling directory happened to be read first.
+    # Within this directory every Lua file has now been inspected, so a setup
+    # here is never missed because a sibling directory was read first. The walk
+    # is still depth-first across directories: if one subtree exhausts the
+    # budget, a later sibling subtree is not reached, and its contents are
+    # absent from the report. That is deliberate. A breadth-first queue shared
+    # across siblings would either hold one descriptor per pending directory,
+    # which is unbounded on a wide tree, or re-resolve directories by path from
+    # the root, which reopens the symlink races the descriptor-relative walk
+    # exists to close. An incomplete scan blocks installation either way, so the
+    # cost is a shorter report, not a setup installed beside an existing one.
     for name in subdirectories:
         if budget.exhausted():
             return

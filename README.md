@@ -45,12 +45,14 @@ an atomic exchange that is reverted if another tool replaced the file in the
 meantime, and a durable transaction marker lets the next run finish or undo an
 edit that was interrupted before validation completed. Binding files over 4 MiB
 are refused, and the scan for an older manual setup is bounded by depth, entry
-count, Lua file count, cumulative bytes, and elapsed time. Files at each level
-are inspected before the scan descends, so a shallow setup is never missed
-because a large sibling directory was read first. If any of those limits stops
-the scan, setup refuses to continue and says which one: an incomplete scan
-cannot show that no manual setup exists, and installing anyway would leave two
-sets of bindings behind.
+count, Lua file count, cumulative bytes, and elapsed time. Within a directory every
+Lua file is inspected before the scan descends into that directory's
+subdirectories. The walk is otherwise depth-first, so if one subtree exhausts a
+budget, a later sibling subtree is not reached and its contents are missing from
+the report. If any limit stops the scan, setup refuses to continue and says
+which limit it hit: an incomplete scan cannot show that no manual setup exists,
+and installing anyway would leave two sets of bindings behind. An incomplete
+report therefore costs detail in the error message, never a second setup.
 
 The scripts never resolve a command through the caller's `PATH`. They replace
 `PATH`, `CDPATH` and `IFS` before running anything external, and derive their
