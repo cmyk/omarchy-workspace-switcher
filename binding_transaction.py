@@ -84,9 +84,15 @@ ENVIRONMENT_ALLOWLIST = (
     "DBUS_SESSION_BUS_ADDRESS",
 )
 
-# Bounds for the manual-setup scan of the Hyprland config tree.
+# Bounds for the manual-setup scan of the Hyprland config tree. Every directory
+# entry counts, not only the Lua files that are opened, and the walk stops at
+# the first budget that runs out.
 SCAN_MAX_DEPTH = 4
+SCAN_MAX_ENTRIES = 5000
 SCAN_MAX_FILES = 2000
+SCAN_MAX_FILE_BYTES = 1024 * 1024
+SCAN_MAX_TOTAL_BYTES = 32 * 1024 * 1024
+SCAN_MAX_SECONDS = 10.0
 SCAN_MAX_MATCHES = 20
 SUPER_TAB_PATTERN = re.compile(rb"SUPER\s*\+\s*(SHIFT\s*\+\s*)?TAB", re.IGNORECASE)
 
@@ -104,6 +110,21 @@ def nofollow_flags():
 
 
 # --- trusted executables and bounded subprocesses ---------------------------
+
+
+def require_private_to_user(info, what):
+    """Refuse anything another unprivileged user could rewrite underneath us.
+
+    The transaction relies on advisory locks and on inode identity, and both
+    assume no second writer outside this user's control.
+    """
+    if info.st_uid != os.geteuid():
+        fail(f"refusing {what}: not owned by the current user")
+    if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        fail(
+            f"refusing {what}: writable by group or other; tighten its "
+            "permissions (chmod go-w) before running setup"
+        )
 
 
 def require_root_owned(info, what):
@@ -249,7 +270,7 @@ class Commands:
 def open_directory(path):
     flags = os.O_RDONLY | os.O_DIRECTORY | nofollow_flags()
     try:
-        return os.open(path, flags)
+        directory_fd = os.open(path, flags)
     except OSError as error:
         if error.errno in (errno.ELOOP, errno.ENOTDIR):
             fail(
@@ -257,6 +278,12 @@ def open_directory(path):
                 "XDG_CONFIG_HOME at the real config root before running setup"
             )
         fail(f"cannot securely open Hyprland config directory {path}: {error}")
+    try:
+        require_private_to_user(os.fstat(directory_fd), f"Hyprland config directory {path}")
+    except BaseException:
+        os.close(directory_fd)
+        raise
+    return directory_fd
 
 
 def lock_descriptor(file_fd, description):
@@ -308,6 +335,7 @@ def open_regular(directory_fd, name, limit, description, missing_ok=False):
         file_stat_before = os.fstat(file_fd)
         if not stat.S_ISREG(file_stat_before.st_mode):
             fail(f"refusing non-regular {description}: {name}")
+        require_private_to_user(file_stat_before, f"{description} {name}")
         if file_stat_before.st_size > limit:
             fail(f"{description} is larger than {limit} bytes; refusing to process it")
         lock_descriptor(file_fd, name)
@@ -541,16 +569,43 @@ def read_marker(directory_fd):
 
 # Durable phases. "staged": backup and marker exist, target untouched.
 # "replaced": exchange done. "validated": Hyprland accepted the change.
-# "enabling": the plugin enable call was issued. "enabled": it returned.
+# "enabling": the enable call is about to be issued, so the plugin may or may
+# not have been enabled by it. "enabled": the call returned successfully.
+# Recovery uses these to describe plugin state, never to undo it.
 PHASES = ("staged", "replaced", "validated", "enabling", "enabled")
+
+
+def plugin_state_notice(record, commands):
+    """Describe, without changing, the plugin state after an interrupted run.
+
+    A crash cannot establish who last changed an external state, so recovery
+    never disables the plugin: between writing the "enabling" phase and the
+    enable call returning, the change may have come from this transaction or
+    from the user. Recovery restores the file it owns and reports the rest.
+    """
+    if record["action"] != "install" or record["previously_enabled"] is not False:
+        return None
+    if record["phase"] not in ("enabling", "enabled"):
+        return None
+    try:
+        currently_enabled = plugin_is_enabled(commands)
+    except TransactionError:
+        currently_enabled = None
+    if currently_enabled is False:
+        return None
+    state = "is enabled" if currently_enabled else "may be enabled"
+    return (
+        f"workspace-switcher binding transaction: the interrupted setup was disabled "
+        f"beforehand and {state} now; plugin state was left unchanged. Run "
+        f"'omarchy plugin disable {PLUGIN_ID}' if you did not want it enabled."
+    )
 
 
 def recover(directory_fd, hyprland_directory, commands):
     """Finish or undo a transaction that died before it was committed.
 
-    Only phases the marker durably recorded are undone: the file is restored
-    only if it still carries the staged content, and the plugin is disabled
-    only if this transaction had reached its enable call.
+    Only the binding file is rolled back, and only when it still carries the
+    staged content. Plugin state is reported, never inferred and undone.
     """
     record = read_marker(directory_fd)
     if record is None:
@@ -582,16 +637,13 @@ def recover(directory_fd, hyprland_directory, commands):
                 f"nor the staged content; backup: {backup_path}; remove {MARKER_NAME} after "
                 "resolving it manually"
             )
-        if (
-            record["action"] == "install"
-            and record["previously_enabled"] is False
-            and record["phase"] in ("enabling", "enabled")
-        ):
-            restore_disabled_plugin_state(commands)
+        notice = plugin_state_notice(record, commands)
     finally:
         os.close(target_fd)
     clear_marker(directory_fd)
     print(f"recovered\t{backup_path}", file=sys.stderr)
+    if notice:
+        print(notice, file=sys.stderr)
 
 
 # --- Hyprland and plugin state ---------------------------------------------
@@ -668,67 +720,108 @@ def edited_contents(action, original_contents, lines, begin_index, end_index):
 # --- entry points -----------------------------------------------------------
 
 
-def scan_manual_setup(directory_fd):
-    """Bounded, no-follow search of the config tree for an older manual setup."""
-    matches = []
-    inspected = 0
-    truncated = False
-    pending = [(directory_fd, "", 0)]
-    opened = []
+class ScanBudget:
+    """Every limit the manual-setup scan is allowed to spend."""
+
+    def __init__(self):
+        self.entries = 0
+        self.files = 0
+        self.total_bytes = 0
+        self.deadline = time.monotonic() + SCAN_MAX_SECONDS
+        self.truncated = False
+
+    def exhausted(self):
+        if (
+            self.entries >= SCAN_MAX_ENTRIES
+            or self.files >= SCAN_MAX_FILES
+            or self.total_bytes >= SCAN_MAX_TOTAL_BYTES
+            or time.monotonic() > self.deadline
+        ):
+            self.truncated = True
+            return True
+        return False
+
+    def remaining_bytes(self):
+        return min(SCAN_MAX_FILE_BYTES, SCAN_MAX_TOTAL_BYTES - self.total_bytes)
+
+
+def scan_lua_file(parent_fd, name, relative, budget, matches):
     try:
-        while pending:
-            parent_fd, prefix, depth = pending.pop()
+        file_fd = os.open(name, os.O_RDONLY | nofollow_flags(), dir_fd=parent_fd)
+    except OSError:
+        return
+    try:
+        info = os.fstat(file_fd)
+        if not stat.S_ISREG(info.st_mode):
+            return
+        budget.files += 1
+        limit = budget.remaining_bytes()
+        if info.st_size > limit:
+            # Too large to inspect within the remaining budget; report it as a
+            # file that was not cleared rather than silently skipping it.
+            budget.truncated = True
+            return
+        contents = read_bounded(file_fd, limit, relative)
+        budget.total_bytes += len(contents)
+        if PLUGIN_ID.encode() in contents:
+            if len(matches) >= SCAN_MAX_MATCHES:
+                budget.truncated = True
+                return
+            matches.append(relative)
+    except (OSError, TransactionError):
+        return
+    finally:
+        os.close(file_fd)
+
+
+def scan_directory(parent_fd, prefix, depth, budget, matches):
+    """Walk one directory. Child descriptors are closed as each subtree ends,
+    so at most SCAN_MAX_DEPTH + 1 descriptors are open at any moment, and the
+    entries are consumed lazily instead of being materialized as a list."""
+    try:
+        entries = os.scandir(parent_fd)
+    except OSError:
+        return
+    with entries:
+        for entry in entries:
+            if budget.exhausted():
+                return
+            budget.entries += 1
             try:
-                with os.scandir(parent_fd) as entries:
-                    children = list(entries)
-            except OSError:
-                continue
-            for entry in children:
-                relative = prefix + entry.name
                 if entry.is_symlink():
                     continue
-                if entry.is_dir(follow_symlinks=False):
-                    if depth + 1 > SCAN_MAX_DEPTH:
-                        truncated = True
-                        continue
-                    try:
-                        child_fd = os.open(
-                            entry.name, os.O_RDONLY | os.O_DIRECTORY | nofollow_flags(), dir_fd=parent_fd
-                        )
-                    except OSError:
-                        continue
-                    opened.append(child_fd)
-                    pending.append((child_fd, relative + "/", depth + 1))
+                is_directory = entry.is_dir(follow_symlinks=False)
+                is_file = entry.is_file(follow_symlinks=False)
+            except OSError:
+                continue
+            relative = prefix + entry.name
+            if is_directory:
+                if depth + 1 > SCAN_MAX_DEPTH:
+                    budget.truncated = True
                     continue
-                if not entry.is_file(follow_symlinks=False) or not entry.name.endswith(".lua"):
-                    continue
-                inspected += 1
-                if inspected > SCAN_MAX_FILES:
-                    truncated = True
-                    break
                 try:
-                    file_fd = os.open(entry.name, os.O_RDONLY | nofollow_flags(), dir_fd=parent_fd)
+                    child_fd = os.open(
+                        entry.name,
+                        os.O_RDONLY | os.O_DIRECTORY | nofollow_flags(),
+                        dir_fd=parent_fd,
+                    )
                 except OSError:
                     continue
                 try:
-                    info = os.fstat(file_fd)
-                    if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_TARGET_BYTES:
-                        continue
-                    if PLUGIN_ID.encode() in read_bounded(file_fd, MAX_TARGET_BYTES, relative):
-                        if len(matches) >= SCAN_MAX_MATCHES:
-                            truncated = True
-                            break
-                        matches.append(relative)
-                except TransactionError:
-                    continue
+                    scan_directory(child_fd, relative + "/", depth + 1, budget, matches)
                 finally:
-                    os.close(file_fd)
-            if inspected > SCAN_MAX_FILES:
-                break
-    finally:
-        for child_fd in opened:
-            os.close(child_fd)
-    return sorted(matches), truncated
+                    os.close(child_fd)
+                continue
+            if is_file and entry.name.endswith(".lua"):
+                scan_lua_file(parent_fd, entry.name, relative, budget, matches)
+
+
+def scan_manual_setup(directory_fd):
+    """Bounded, no-follow search of the config tree for an older manual setup."""
+    matches = []
+    budget = ScanBudget()
+    scan_directory(directory_fd, "", 0, budget, matches)
+    return sorted(matches), budget.truncated
 
 
 def super_tab_lines(lines):

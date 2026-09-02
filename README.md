@@ -44,17 +44,38 @@ no-follow, atomic, and flushed to disk before validation. The replacement is
 an atomic exchange that is reverted if another tool replaced the file in the
 meantime, and a durable transaction marker lets the next run finish or undo an
 edit that was interrupted before validation completed. Binding files over 4 MiB
-are refused. The scripts never consult `PATH`: `hyprctl` and `omarchy` are
-opened at their fixed `/usr/bin` locations, verified to be root-owned regular
-files, executed through that verified descriptor, and run with a deadline, an
-output cap, and an explicit allowlisted environment. The transaction journals
-each phase durably and re-checks that `bindings.lua` still names the published
-file before validation, plugin enabling, and commit. Pass `--yes` for
-non-interactive setup.
+are refused, and the scan for an older manual setup is bounded by depth, entry
+count, cumulative bytes, and elapsed time.
+
+The scripts never resolve a command through the caller's `PATH`. They replace
+`PATH`, `CDPATH` and `IFS` before running anything external, and derive their
+own location with shell builtins rather than `dirname`. `hyprctl` and `omarchy`
+are opened at their fixed `/usr/bin` locations and verified as root-owned
+regular files in a root-owned directory; `hyprctl` is then executed through that
+verified descriptor, and `omarchy` by its verified path, because it locates its
+own subcommands relative to that path. Both run with a deadline, an output cap,
+and an explicit allowlisted environment.
+
+The transaction journals each phase durably and re-checks that `bindings.lua`
+still names the published file before validation, plugin enabling, and commit.
+After an interrupted run, recovery restores the binding file it owns but never
+changes the plugin's enabled state: a crash cannot establish who last changed
+it, so the state is reported instead. Pass `--yes` for non-interactive setup.
+
+Setup refuses a Hyprland config directory or `bindings.lua` that is not owned by
+you, or that is writable by group or other, because the transaction relies on
+advisory locks and on no second writer outside your control.
+
+Scope: the dynamic loader acts before the first line of either script, so
+`LD_PRELOAD` and similar variables cannot be neutralized from inside the process
+they affect. The scripts scrub the environment they hand to every command they
+run, and the test suite verifies that with a real preloaded library, but anyone
+who can set those variables in your environment can already run code as you.
 
 The test suite (`tests/setup.sh`) runs inside an unprivileged user namespace
 and binds a mock `/usr/bin` over the real one, so it needs `unshare` with user
-namespaces enabled.
+namespaces enabled. A C compiler is optional; when present the suite builds a
+real preloaded library to measure the environment boundary.
 
 For transaction safety, guided setup refuses a symlinked Hyprland config
 directory or `bindings.lua`. If your dotfiles use symlinks, point
