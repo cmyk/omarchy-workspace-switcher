@@ -41,37 +41,43 @@ def expect(condition, message):
 
 
 class Case:
+    """One scenario. The suite runs inside tests/setup.sh's namespace, where
+    /usr/bin/hyprctl and /usr/bin/omarchy are dispatchers that exec the
+    per-case scripts written under mock/ and log every call to commands.log."""
+
     def __init__(self, root, name, enabled=True):
         self.dir = os.path.join(root, name)
         self.hypr = os.path.join(self.dir, "config", "hypr")
-        self.bin = os.path.join(self.dir, "bin")
+        self.mock = os.path.join(self.dir, "mock")
         self.log = os.path.join(self.dir, "commands.log")
         os.makedirs(self.hypr)
-        os.makedirs(self.bin)
+        os.makedirs(self.mock)
         self.target = os.path.join(self.hypr, "bindings.lua")
         with open(self.target, "wb") as handle:
             handle.write(ORIGINAL)
+        self.set_enabled(enabled)
+        self.write_mock("hyprctl", "")
+
+    def set_enabled(self, enabled):
         self.write_mock(
             "omarchy",
             f"""
-            printf '%s\\n' "$*" >> "$MOCK_LOG"
             if [[ $* == 'plugin list --json' ]]; then
               printf '[{{"id":"reomarchy.workspace-switcher","enabled":{str(enabled).lower()}}}]\\n'
             fi
             """,
         )
-        self.write_mock("hyprctl", 'printf \'%s\\n\' "$*" >> "$MOCK_LOG"\n')
 
     def write_mock(self, name, body):
-        path = os.path.join(self.bin, name)
+        path = os.path.join(self.mock, name)
         with open(path, "w") as handle:
-            handle.write("#!/usr/bin/env bash\n" + textwrap.dedent(body))
+            handle.write("#!/bin/bash\n" + textwrap.dedent(body))
         os.chmod(path, 0o755)
 
     def env(self):
         env = dict(os.environ)
-        env["PATH"] = self.bin + os.pathsep + env.get("PATH", "")
-        env["MOCK_LOG"] = self.log
+        env["XDG_CONFIG_HOME"] = os.path.join(self.dir, "config")
+        env["HOME"] = self.dir
         return env
 
     def apply_env(self):
@@ -98,7 +104,7 @@ class Case:
         env = self.env()
         env.update(env_extra or {})
         return subprocess.run(
-            [sys.executable, HELPER, action, self.hypr],
+            ["/usr/bin/python3", "-I", HELPER, action, self.hypr],
             capture_output=True,
             text=True,
             env=env,
@@ -130,7 +136,6 @@ def test_hung_command(root):
     case.write_mock(
         "hyprctl",
         f"""
-        printf '%s\\n' "$*" >> "$MOCK_LOG"
         if [[ $1 == reload ]]; then
           ps -o pgid= -p $$ | tr -d ' ' > {pgid_file}
           sleep 300 &
@@ -156,7 +161,7 @@ def test_hung_command(root):
     except ProcessLookupError:
         pass
     # Once hyprctl responds again, the next run finishes the recovery.
-    case.write_mock("hyprctl", 'printf \'%s\\n\' "$*" >> "$MOCK_LOG"\n')
+    case.write_mock("hyprctl", "")
     recovery = case.run_helper("check")
     expect(recovery.returncode == 0 and recovery.stdout.strip() == "absent", f"recovery after hang failed: {recovery.stderr}")
     expect(not case.marker_exists(), "marker not cleared after recovery from hang")
@@ -167,9 +172,9 @@ def test_output_flood(root):
     case.write_mock(
         "hyprctl",
         """
-        printf '%s\\n' "$*" >> "$MOCK_LOG"
-        if [[ $1 == configerrors && ! -e "$MOCK_LOG.flooded" ]]; then
-          : > "$MOCK_LOG.flooded"
+        flooded="$XDG_CONFIG_HOME/../flooded"
+        if [[ $1 == configerrors && ! -e $flooded ]]; then
+          : > "$flooded"
           yes 'error' | head -c 8000000
         fi
         """,
@@ -234,7 +239,7 @@ def test_crash_recovery(root):
     for label, function in CRASH_POINTS:
         case = Case(root, f"crash-{label}", enabled=False)
         result = subprocess.run(
-            [sys.executable, "-c", CRASH_DRIVER, HELPER, function, case.hypr],
+            ["/usr/bin/python3", "-I", "-c", CRASH_DRIVER, HELPER, function, case.hypr],
             capture_output=True,
             text=True,
             env=case.env(),
@@ -261,8 +266,10 @@ def test_crash_recovery(root):
         expect(not os.path.exists(marker_path), f"{label}: marker not cleared after recovery")
         expect(not case.temp_files(), f"{label}: staging files left after recovery")
         log = case.logged()
-        if function != "create_backup":
+        if function == "enable_plugin":
             expect("plugin disable" in log, f"{label}: plugin state not restored on recovery")
+        else:
+            expect("plugin disable" not in log, f"{label}: plugin disabled although enable was never reached")
         if function in ("replace_target", "validate_hyprland", "enable_plugin"):
             expect("reload" in log[len(log_before):], f"{label}: Hyprland not reloaded after restore")
         backups = [n for n in os.listdir(case.hypr) if ".bak.workspace-switcher-install." in n]
@@ -274,6 +281,64 @@ def test_crash_recovery(root):
         rerun = case.run_helper("install")
         expect(rerun.returncode == 0, f"{label}: install after recovery failed: {rerun.stderr}")
         expect(case.read_target() == installed_contents(module), f"{label}: install after recovery incomplete")
+
+
+def test_replace_after_exchange(root):
+    """A non-cooperating editor replaces bindings.lua after the exchange."""
+    intruder = b"-- Replaced after the exchange\n"
+    for stage in ("validate_hyprland", "enable_plugin"):
+        case = Case(root, f"post-exchange-{stage}", enabled=False)
+
+        def patch(module, stage=stage):
+            real = getattr(module, stage)
+
+            def race(*args, **kwargs):
+                result = real(*args, **kwargs)
+                temp = case.target + ".other"
+                with open(temp, "wb") as handle:
+                    handle.write(intruder)
+                os.replace(temp, case.target)
+                return result
+
+            setattr(module, stage, race)
+
+        module, error = in_process(case, "install", patch)
+        expect(error and "replaced by another program" in error, f"{stage}: replacement not detected: {error}")
+        expect(case.read_target() == intruder, f"{stage}: foreign file was overwritten")
+        expect(not case.marker_exists(), f"{stage}: marker left behind")
+        expect(not case.temp_files(), f"{stage}: staging files left behind")
+        log = case.logged()
+        if stage == "enable_plugin":
+            expect("plugin enable" in log and "plugin disable" in log, f"{stage}: enable not undone")
+        else:
+            expect("plugin enable" not in log, f"{stage}: plugin enabled against a foreign file")
+        # Nothing is pending, so a later check reports the foreign file as-is.
+        check = case.run_helper("check")
+        expect(check.returncode == 0 and check.stdout.strip() == "absent", f"{stage}: post-state check failed: {check.stderr}")
+        expect(case.read_target() == intruder, f"{stage}: recovery touched the foreign file")
+
+
+def test_independent_enable_after_crash(root):
+    """A crash before replacement, then the user enables the plugin themselves.
+    Recovery must not undo that enable."""
+    case = Case(root, "independent-enable", enabled=False)
+    result = subprocess.run(
+        ["/usr/bin/python3", "-I", "-c", CRASH_DRIVER, HELPER, "write_marker", case.hypr],
+        capture_output=True,
+        text=True,
+        env=case.env(),
+    )
+    expect(result.returncode == 137, f"driver did not crash ({result.stderr})")
+    expect(case.marker_exists(), "marker missing after crash")
+    expect(case.read_target() == ORIGINAL, "target changed before replacement")
+    # The user enables the plugin independently.
+    case.set_enabled(True)
+    log_before = case.logged()
+    recovery = case.run_helper("check")
+    expect(recovery.returncode == 0, f"recovery failed: {recovery.stderr}")
+    expect("plugin disable" not in case.logged()[len(log_before):], "recovery undid an independent enable")
+    expect(not case.marker_exists(), "marker not cleared")
+    expect(case.read_target() == ORIGINAL, "target changed by recovery")
 
 
 def test_tampered_marker(root):
@@ -289,6 +354,7 @@ def test_tampered_marker(root):
                 "new_sha256": "0" * 64,
                 "mode": 0o644,
                 "previously_enabled": True,
+                "phase": "staged",
             },
             handle,
         )
@@ -306,6 +372,7 @@ def test_tampered_marker(root):
                 "new_sha256": "2" * 64,
                 "mode": 0o644,
                 "previously_enabled": True,
+                "phase": "replaced",
             },
             handle,
         )
@@ -321,6 +388,8 @@ def main():
         test_output_flood(root)
         test_concurrent_replace(root)
         test_crash_recovery(root)
+        test_replace_after_exchange(root)
+        test_independent_enable_after_crash(root)
         test_tampered_marker(root)
     print("transaction tests: pass")
 

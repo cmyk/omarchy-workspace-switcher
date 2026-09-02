@@ -1,4 +1,5 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
+# -p: ignore BASH_ENV, ENV, SHELLOPTS and functions inherited from the environment.
 set -euo pipefail
 
 plugin_id="reomarchy.workspace-switcher"
@@ -10,9 +11,29 @@ transaction_helper="$script_dir/binding_transaction.py"
 assume_yes=0
 keep_plugin=0
 
+# Fixed tool locations; nothing is resolved through PATH.
+env_bin=/usr/bin/env
+python_bin=/usr/bin/python3
+omarchy_bin=/usr/bin/omarchy
+
 fail() {
   printf 'workspace-switcher removal: %s\n' "$*" >&2
   exit 1
+}
+
+clean_env=(PATH=/usr/bin:/bin OMARCHY_PATH=/usr/share/omarchy)
+for name in HOME USER LOGNAME LANG LC_ALL TERM XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME \
+  XDG_STATE_HOME XDG_RUNTIME_DIR XDG_SESSION_TYPE HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY \
+  DBUS_SESSION_BUS_ADDRESS; do
+  [[ -n ${!name:-} ]] && clean_env+=("$name=${!name}")
+done
+
+run_clean() {
+  "$env_bin" -i "${clean_env[@]}" "$@"
+}
+
+run_helper() {
+  run_clean "$python_bin" -I "$transaction_helper" "$@"
 }
 
 while (( $# > 0 )); do
@@ -28,12 +49,13 @@ while (( $# > 0 )); do
   shift
 done
 
-[[ -x $transaction_helper ]] || fail "binding transaction helper is missing or not executable"
+for tool in "$env_bin" "$python_bin"; do
+  [[ -f $tool && -x $tool ]] || fail "required system tool is missing: $tool"
+done
+[[ -f $transaction_helper ]] || fail "binding transaction helper is missing"
 
-if [[ -f $bindings_file ]]; then
-  transaction_result=$(
-    "$transaction_helper" remove "$hypr_dir"
-  ) || fail "binding transaction failed"
+if [[ -e $bindings_file || -L $bindings_file ]]; then
+  transaction_result=$(run_helper remove "$hypr_dir") || fail "binding transaction failed"
   IFS=$'\t' read -r transaction_status backup <<< "$transaction_result"
 
   if [[ $transaction_status == changed && -n ${backup:-} ]]; then
@@ -46,7 +68,8 @@ if [[ -f $bindings_file ]]; then
 fi
 
 if (( ! keep_plugin )); then
+  [[ -f $omarchy_bin && -x $omarchy_bin ]] || fail "required system tool is missing: $omarchy_bin"
   remove_args=(plugin remove "$plugin_id")
   (( assume_yes )) && remove_args+=(--yes)
-  omarchy "${remove_args[@]}"
+  run_clean "$omarchy_bin" "${remove_args[@]}"
 fi
