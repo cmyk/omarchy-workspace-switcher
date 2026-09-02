@@ -1,67 +1,119 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
+# The installer only executes fixed root-owned tools (/usr/bin/hyprctl,
+# /usr/bin/omarchy) and never consults PATH, so the suite runs inside a user and
+# mount namespace. The real /usr/bin is bound aside and a namespace-owned
+# directory of symlinks to it, plus the two mock dispatchers, is bound over
+# /usr/bin. Inside the namespace that directory and the mocks are owned by uid
+# 0, which satisfies the helper's root-ownership checks.
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
-test_root=$(mktemp -d)
-trap 'rm -rf -- "$test_root"' EXIT
 
 fail() {
   printf 'setup test: %s\n' "$*" >&2
   exit 1
 }
 
-mock_bin="$test_root/bin"
-mkdir -p "$mock_bin"
+if [[ ${1:-} != --in-namespace ]]; then
+  command -v unshare >/dev/null 2>&1 || fail "unshare is required to run the suite"
+  unshare -Urm --propagation private true 2>/dev/null || fail "unprivileged user namespaces are unavailable"
+  exec unshare -Urm --propagation private /bin/bash "${BASH_SOURCE[0]}" --in-namespace
+fi
 
-cat > "$mock_bin/omarchy" <<'MOCK'
-#!/usr/bin/env bash
-printf '%s\n' "$*" >> "$MOCK_LOG"
-if [[ $* == 'plugin list --json' ]]; then
-  printf '[{"id":"reomarchy.workspace-switcher","enabled":%s}]\n' "${MOCK_PLUGIN_ENABLED:-true}"
-elif [[ $* == 'plugin enable reomarchy.workspace-switcher' && ${MOCK_ENABLE_FAIL:-0} == 1 ]]; then
-  printf '%s\n' 'synthetic enable failure' >&2
-  exit 1
-elif [[ $* == 'plugin enable reomarchy.workspace-switcher' ]]; then
-  printf '%s\n' 'Enabled reomarchy.workspace-switcher'
-elif [[ $* == 'plugin disable reomarchy.workspace-switcher' && ${MOCK_DISABLE_FAIL:-0} == 1 ]]; then
-  printf '%s\n' 'synthetic disable failure' >&2
-  exit 1
+test_root=$(mktemp -d)
+real_bin="$test_root/realbin"
+mock_bin="$test_root/fakebin"
+mkdir -p "$real_bin" "$mock_bin"
+mount --bind /usr/bin "$real_bin"
+mount -o remount,bind,ro "$real_bin"
+cleanup() {
+  umount /usr/bin 2>/dev/null || true
+  umount "$real_bin" 2>/dev/null || true
+  mountpoint -q "$real_bin" && return
+  rm -rf -- "$test_root"
+}
+trap cleanup EXIT
+while IFS= read -r -d '' name; do
+  ln -s -- "$real_bin/$name" "$mock_bin/$name"
+done < <(find "$real_bin" -mindepth 1 -maxdepth 1 -printf '%f\0')
+rm -f -- "$mock_bin/hyprctl" "$mock_bin/omarchy"
+
+# Dispatchers receive only the allowlisted environment, so every per-case knob
+# lives in files under "$XDG_CONFIG_HOME/../mock". A per-case executable there
+# replaces the default behaviour entirely.
+write_dispatcher() {
+  local name="$1"
+  cat > "$mock_bin/$name" <<MOCK
+#!/bin/bash
+name=$name
+case_root="\${XDG_CONFIG_HOME:?}/.."
+mock_root="\$case_root/mock"
+log="\$case_root/commands.log"
+printf '%s\\n' "\$*" >> "\$log"
+env | sort > "\$case_root/env.\$name.log"
+if [[ -x \$mock_root/\$name ]]; then
+  exec "\$mock_root/\$name" "\$@"
 fi
 MOCK
+  chmod 755 "$mock_bin/$name"
+}
 
-cat > "$mock_bin/hyprctl" <<'MOCK'
-#!/usr/bin/env bash
-printf '%s\n' "$*" >> "$MOCK_LOG"
-if [[ ${1:-} == configerrors && -n ${MOCK_CONFIG_ERRORS:-} ]]; then
-  error_marker="${MOCK_LOG}.config-error-returned"
+write_dispatcher hyprctl
+cat >> "$mock_bin/hyprctl" <<'MOCK'
+if [[ ${1:-} == configerrors && -e $mock_root/config-errors ]]; then
+  error_marker="$log.config-error-returned"
   if [[ ! -e $error_marker ]]; then
-    printf '%s\n' "$MOCK_CONFIG_ERRORS"
+    cat "$mock_root/config-errors"
     : > "$error_marker"
   fi
 fi
 MOCK
 
-chmod +x "$mock_bin/omarchy" "$mock_bin/hyprctl"
+write_dispatcher omarchy
+cat >> "$mock_bin/omarchy" <<'MOCK'
+if [[ $* == 'plugin list --json' ]]; then
+  enabled=true
+  [[ -e $mock_root/plugin-disabled ]] && enabled=false
+  printf '[{"id":"reomarchy.workspace-switcher","enabled":%s}]\n' "$enabled"
+elif [[ $* == 'plugin enable reomarchy.workspace-switcher' && -e $mock_root/enable-fail ]]; then
+  printf '%s\n' 'synthetic enable failure' >&2
+  exit 1
+elif [[ $* == 'plugin enable reomarchy.workspace-switcher' ]]; then
+  printf '%s\n' 'Enabled reomarchy.workspace-switcher'
+elif [[ $* == 'plugin disable reomarchy.workspace-switcher' && -e $mock_root/disable-fail ]]; then
+  printf '%s\n' 'synthetic disable failure' >&2
+  exit 1
+fi
+MOCK
+
+mount --bind "$mock_bin" /usr/bin
+[[ $(stat -c '%u' /usr/bin /usr/bin/hyprctl /usr/bin/omarchy | sort -u) == 0 ]] || fail "namespace mount did not take ownership of /usr/bin"
+/usr/bin/python3 -I -c 'pass' || fail "python is not reachable through the namespace /usr/bin"
 
 new_case() {
   local name="$1"
   local case_dir="$test_root/$name"
-  mkdir -p "$case_dir/config/hypr" "$case_dir/home"
+  mkdir -p "$case_dir/config/hypr" "$case_dir/home" "$case_dir/mock"
   printf '%s\n' '-- Personal bindings' > "$case_dir/config/hypr/bindings.lua"
   printf '%s\n' "$case_dir"
 }
 
+# run_install CASE [config-errors] [plugin-enabled true|false] [enable-fail 0|1] [disable-fail 0|1]
 run_install() {
   local case_dir="$1"
-  env PATH="$mock_bin:$PATH" \
-    HOME="$case_dir/home" \
-    XDG_CONFIG_HOME="$case_dir/config" \
-    MOCK_LOG="$case_dir/commands.log" \
-    MOCK_CONFIG_ERRORS="${2:-}" \
-    MOCK_PLUGIN_ENABLED="${3:-true}" \
-    MOCK_ENABLE_FAIL="${4:-0}" \
-    MOCK_DISABLE_FAIL="${5:-0}" \
-    "$repo_dir/install.sh" --yes
+  rm -f -- "$case_dir/mock/config-errors" "$case_dir/mock/plugin-disabled" \
+    "$case_dir/mock/enable-fail" "$case_dir/mock/disable-fail"
+  [[ -n ${2:-} ]] && printf '%s\n' "$2" > "$case_dir/mock/config-errors"
+  [[ ${3:-true} == false ]] && : > "$case_dir/mock/plugin-disabled"
+  [[ ${4:-0} == 1 ]] && : > "$case_dir/mock/enable-fail"
+  [[ ${5:-0} == 1 ]] && : > "$case_dir/mock/disable-fail"
+  env HOME="$case_dir/home" XDG_CONFIG_HOME="$case_dir/config" "$repo_dir/install.sh" --yes
+}
+
+run_uninstall() {
+  local case_dir="$1"
+  shift
+  env HOME="$case_dir/home" XDG_CONFIG_HOME="$case_dir/config" "$repo_dir/uninstall.sh" --yes "$@"
 }
 
 case_dir=$(new_case success)
@@ -76,17 +128,15 @@ backup=$(find "$case_dir/config/hypr" -maxdepth 1 -name 'bindings.lua.bak.worksp
 [[ -n $backup ]] || fail "install backup missing"
 cmp -s -- "$original_bindings" "$backup" || fail "install backup does not match the original"
 [[ $(stat -c '%a' "$bindings") == 640 ]] || fail "installer did not preserve binding file mode"
+[[ ! -e $case_dir/config/hypr/.workspace-switcher-transaction.json ]] || fail "marker left after a successful install"
 if command -v luac >/dev/null 2>&1; then luac -p "$bindings"; fi
 
 run_install "$case_dir"
 [[ $(grep -Fc -- '-- Workspace Switcher: begin' "$bindings") == 1 ]] || fail "installer is not idempotent"
 
-env PATH="$mock_bin:$PATH" \
-  HOME="$case_dir/home" \
-  XDG_CONFIG_HOME="$case_dir/config" \
-  MOCK_LOG="$case_dir/commands.log" \
-  "$repo_dir/uninstall.sh" --yes
+run_uninstall "$case_dir"
 ! grep -Fq -- '-- Workspace Switcher: begin' "$bindings" || fail "uninstaller left its marker block"
+cmp -s -- "$original_bindings" "$bindings" || fail "remove and install did not round-trip byte for byte"
 grep -Fq -- 'plugin remove reomarchy.workspace-switcher --yes' "$case_dir/commands.log" || fail "plugin removal was not delegated"
 
 case_dir=$(new_case rollback)
@@ -120,10 +170,83 @@ grep -Fq -- 'plugin enable reomarchy.workspace-switcher' "$case_dir/commands.log
 
 case_dir=$(new_case manual)
 printf '%s\n' 'hl.exec_cmd("omarchy-shell shell summon reomarchy.workspace-switcher")' > "$case_dir/config/hypr/old-setup.lua"
-if run_install "$case_dir"; then
+if run_install "$case_dir" 2> "$case_dir/error.log"; then
   fail "installer duplicated an existing manual setup"
 fi
+grep -Fq -- 'old-setup.lua' "$case_dir/error.log" || fail "manual setup file was not named"
 ! grep -Fq -- '-- Workspace Switcher: begin' "$case_dir/config/hypr/bindings.lua" || fail "manual setup detection changed bindings"
+
+case_dir=$(new_case scan-bounds)
+hypr="$case_dir/config/hypr"
+outside="$case_dir/outside"
+mkdir -p "$outside/deep" "$hypr/a/b/c/d/e"
+printf '%s\n' 'hl.exec_cmd("omarchy-shell shell summon reomarchy.workspace-switcher")' > "$outside/deep/linked-setup.lua"
+ln -s -- "$outside" "$hypr/linked-dir"
+ln -s -- "$outside/deep/linked-setup.lua" "$hypr/linked-file.lua"
+printf '%s\n' 'hl.exec_cmd("omarchy-shell shell summon reomarchy.workspace-switcher")' > "$hypr/a/b/c/d/e/too-deep.lua"
+head -c 4194305 /dev/zero | tr '\0' '-' > "$hypr/a/huge.lua"
+printf '%s\n' 'reomarchy.workspace-switcher' >> "$hypr/a/huge.lua"
+mkdir -p "$hypr/many"
+for i in $(seq 1 2100); do : > "$hypr/many/f$i.lua"; done
+start=$(date +%s)
+run_install "$case_dir" 2> "$case_dir/error.log"
+elapsed=$(( $(date +%s) - start ))
+(( elapsed < 30 )) || fail "bounded scan took ${elapsed}s"
+grep -Fq -- '-- Workspace Switcher: begin' "$hypr/bindings.lua" || fail "install refused despite no reachable manual setup"
+! grep -Fq -- 'linked' "$case_dir/error.log" || fail "scan followed a symlink"
+
+case_dir=$(new_case scan-depth-hit)
+hypr="$case_dir/config/hypr"
+mkdir -p "$hypr/conf.d/extra"
+printf '%s\n' 'hl.exec_cmd("omarchy-shell shell summon reomarchy.workspace-switcher")' > "$hypr/conf.d/extra/switcher.lua"
+if run_install "$case_dir" 2> "$case_dir/error.log"; then
+  fail "installer missed a nested manual setup"
+fi
+grep -Fq -- 'conf.d/extra/switcher.lua' "$case_dir/error.log" || fail "nested manual setup was not named"
+
+case_dir=$(new_case hostile-environment)
+evil="$case_dir/evil"
+mkdir -p "$evil/py"
+for tool in hyprctl omarchy jq python3 grep gum env bash unshare; do
+  printf '#!/bin/bash\n: > "%s/ran-%s"\nexit 1\n' "$evil" "$tool" > "$evil/$tool"
+  chmod 755 "$evil/$tool"
+done
+printf '%s\n' 'raise SystemExit("hostile json module imported")' > "$evil/py/json.py"
+printf '%s\n' ": > '$evil/bash-env-ran'" > "$evil/bash_env.sh"
+if ! env PATH="$evil:$PATH" \
+  LD_PRELOAD="$evil/nonexistent.so" \
+  PYTHONPATH="$evil/py" \
+  PYTHONSTARTUP="$evil/py/json.py" \
+  BASH_ENV="$evil/bash_env.sh" \
+  ENV="$evil/bash_env.sh" \
+  HOME="$case_dir/home" XDG_CONFIG_HOME="$case_dir/config" \
+  "$repo_dir/install.sh" --yes 2> "$case_dir/error.log"; then
+  cat "$case_dir/error.log" >&2
+  fail "installer failed under a hostile environment"
+fi
+grep -Fq -- '-- Workspace Switcher: begin' "$case_dir/config/hypr/bindings.lua" || fail "hostile-environment install incomplete"
+ran=$(find "$evil" -maxdepth 1 -name 'ran-*' -o -maxdepth 1 -name 'bash-env-ran')
+[[ -z $ran ]] || fail "PATH or startup-file replacement was executed: $ran"
+for name in hyprctl omarchy; do
+  env_log="$case_dir/env.$name.log"
+  [[ -f $env_log ]] || fail "$name env log missing"
+  grep -qx 'PATH=/usr/bin:/bin' "$env_log" || fail "$name did not receive the fixed PATH"
+  ! grep -Eq '^(LD_PRELOAD|PYTHONPATH|PYTHONSTARTUP|BASH_ENV|ENV)=' "$env_log" || fail "$name inherited a hostile variable"
+done
+
+case_dir=$(new_case untrusted-executable)
+bindings="$case_dir/config/hypr/bindings.lua"
+original=$(sha256sum "$bindings" | cut -d' ' -f1)
+chmod o+w /usr/bin/hyprctl
+if run_install "$case_dir" 2> "$case_dir/error.log"; then
+  chmod o-w /usr/bin/hyprctl
+  fail "installer ran a world-writable hyprctl"
+fi
+chmod o-w /usr/bin/hyprctl
+grep -Fq -- 'writable by other users' "$case_dir/error.log" || fail "untrusted executable error lacks guidance"
+unchanged=$(sha256sum "$bindings" | cut -d' ' -f1)
+[[ $original == "$unchanged" ]] || fail "installer changed a file with an untrusted executable"
+[[ ! -e $case_dir/commands.log ]] || fail "installer invoked an untrusted hyprctl"
 
 case_dir=$(new_case reversed-markers)
 bindings="$case_dir/config/hypr/bindings.lua"
@@ -134,11 +257,7 @@ cat >> "$bindings" <<'LUA'
 -- trailing content that must survive
 LUA
 original=$(sha256sum "$bindings" | cut -d' ' -f1)
-if env PATH="$mock_bin:$PATH" \
-  HOME="$case_dir/home" \
-  XDG_CONFIG_HOME="$case_dir/config" \
-  MOCK_LOG="$case_dir/commands.log" \
-  "$repo_dir/uninstall.sh" --yes --keep-plugin; then
+if run_uninstall "$case_dir" --keep-plugin; then
   fail "uninstaller accepted reversed binding markers"
 fi
 unchanged=$(sha256sum "$bindings" | cut -d' ' -f1)
@@ -152,11 +271,7 @@ cat >> "$bindings" <<'LUA'
 -- Workspace Switcher: end
 LUA
 original=$(sha256sum "$bindings" | cut -d' ' -f1)
-if env PATH="$mock_bin:$PATH" \
-  HOME="$case_dir/home" \
-  XDG_CONFIG_HOME="$case_dir/config" \
-  MOCK_LOG="$case_dir/commands.log" \
-  "$repo_dir/uninstall.sh" --yes --keep-plugin; then
+if run_uninstall "$case_dir" --keep-plugin; then
   fail "uninstaller accepted nested binding markers"
 fi
 unchanged=$(sha256sum "$bindings" | cut -d' ' -f1)
@@ -199,6 +314,11 @@ fi
 grep -Fq -- 'refusing symlinked bindings.lua' "$case_dir/error.log" || fail "symlinked binding error lacks guidance"
 unchanged=$(sha256sum "$victim" | cut -d' ' -f1)
 [[ $original == "$unchanged" ]] || fail "installer changed a symlink target"
+if run_uninstall "$case_dir" --keep-plugin 2> "$case_dir/error.log"; then
+  fail "uninstaller followed a symlinked binding file"
+fi
+unchanged=$(sha256sum "$victim" | cut -d' ' -f1)
+[[ $original == "$unchanged" ]] || fail "uninstaller changed a symlink target"
 
 case_dir=$(new_case symlink-directory)
 mv -- "$case_dir/config/hypr" "$case_dir/config/real-hypr"
@@ -223,21 +343,7 @@ grep -Fq -- 'larger than' "$case_dir/error.log" || fail "oversized binding file 
 unchanged=$(sha256sum "$bindings" | cut -d' ' -f1)
 [[ $original == "$unchanged" ]] || fail "installer changed an oversized binding file"
 
-case_dir=$(new_case untrusted-executable)
-bindings="$case_dir/config/hypr/bindings.lua"
-original=$(sha256sum "$bindings" | cut -d' ' -f1)
-chmod o+w "$mock_bin/hyprctl"
-if run_install "$case_dir" 2> "$case_dir/error.log"; then
-  chmod o-w "$mock_bin/hyprctl"
-  fail "installer ran a world-writable hyprctl"
-fi
-chmod o-w "$mock_bin/hyprctl"
-grep -Fq -- 'writable by other users' "$case_dir/error.log" || fail "untrusted executable error lacks guidance"
-unchanged=$(sha256sum "$bindings" | cut -d' ' -f1)
-[[ $original == "$unchanged" ]] || fail "installer changed a file with an untrusted executable"
-! grep -q 'reload' "$case_dir/commands.log" 2>/dev/null || fail "installer invoked an untrusted hyprctl"
-
-python3 "$repo_dir/tests/transaction.py"
+/usr/bin/python3 -I "$repo_dir/tests/transaction.py"
 
 ! grep -Eq -- 'hl\.(un)?bind\("SUPER \+ mouse' "$repo_dir/bindings.lua" || fail "runtime bindings still replace Super+mouse mappings"
 if command -v lua >/dev/null 2>&1; then

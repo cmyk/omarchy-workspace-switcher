@@ -44,8 +44,17 @@ no-follow, atomic, and flushed to disk before validation. The replacement is
 an atomic exchange that is reverted if another tool replaced the file in the
 meantime, and a durable transaction marker lets the next run finish or undo an
 edit that was interrupted before validation completed. Binding files over 4 MiB
-are refused, and `hyprctl`/`omarchy` are resolved to trusted executables and run
-with deadlines and output caps. Pass `--yes` for non-interactive setup.
+are refused. The scripts never consult `PATH`: `hyprctl` and `omarchy` are
+opened at their fixed `/usr/bin` locations, verified to be root-owned regular
+files, executed through that verified descriptor, and run with a deadline, an
+output cap, and an explicit allowlisted environment. The transaction journals
+each phase durably and re-checks that `bindings.lua` still names the published
+file before validation, plugin enabling, and commit. Pass `--yes` for
+non-interactive setup.
+
+The test suite (`tests/setup.sh`) runs inside an unprivileged user namespace
+and binds a mock `/usr/bin` over the real one, so it needs `unshare` with user
+namespaces enabled.
 
 For transaction safety, guided setup refuses a symlinked Hyprland config
 directory or `bindings.lua`. If your dotfiles use symlinks, point
