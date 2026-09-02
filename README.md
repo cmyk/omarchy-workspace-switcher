@@ -39,7 +39,14 @@ The guided setup explains that it replaces Omarchy's immediate
 `Super+Tab`/`Super+Shift+Tab` workspace cycling, checks for an existing manual
 setup, asks for confirmation, backs up `~/.config/hypr/bindings.lua`, and adds
 only a marked loader block. It reloads Hyprland and rolls the change back if
-configuration validation fails. Pass `--yes` for non-interactive setup.
+configuration validation or plugin enabling fails. The file update is locked,
+no-follow, atomic, and flushed to disk before validation. Pass `--yes` for
+non-interactive setup.
+
+For transaction safety, guided setup refuses a symlinked Hyprland config
+directory or `bindings.lua`. If your dotfiles use symlinks, point
+`XDG_CONFIG_HOME` at the real config root before running setup, or configure
+the loader manually.
 
 If you already installed the bindings documented by version 0.2.x, keep that
 manual setup or remove its old Lua block before running `install.sh`.
