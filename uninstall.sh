@@ -1,9 +1,30 @@
 #!/bin/bash -p
-# -p: ignore BASH_ENV, ENV, SHELLOPTS and functions inherited from the environment.
+# -p makes bash ignore BASH_ENV, ENV, SHELLOPTS and inherited shell functions.
+# PATH, CDPATH and IFS are replaced before anything is looked up, and this
+# script runs no external command until it has done so, so nothing here is
+# resolved through a caller-controlled search path.
+#
+# Scope: the dynamic loader acts before the first line of this script, so
+# LD_PRELOAD and friends cannot be neutralized from inside the process they
+# affect. Anyone who can set them in your environment can already run code as
+# you; see the README.
+PATH=/usr/bin:/bin
+# Dropping the loader variables here cannot unmap what is already loaded into
+# this shell, but it does keep them out of every process the script starts,
+# including /usr/bin/env itself, whose own environment `env -i` cannot change.
+unset LD_PRELOAD LD_AUDIT LD_LIBRARY_PATH LD_ORIGIN_PATH LD_DEBUG LD_DEBUG_OUTPUT
+unset CDPATH BASH_ENV ENV
+IFS=$' \t\n'
 set -euo pipefail
 
 plugin_id="reomarchy.workspace-switcher"
-script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+# cd and pwd are builtins; dirname is not, so the directory is derived with
+# parameter expansion instead of an external command.
+case "${BASH_SOURCE[0]}" in
+  */*) script_dir_raw="${BASH_SOURCE[0]%/*}" ;;
+  *) script_dir_raw="." ;;
+esac
+script_dir=$(cd -- "$script_dir_raw" && pwd -P)
 config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
 hypr_dir="$config_home/hypr"
 bindings_file="$hypr_dir/bindings.lua"

@@ -44,17 +44,51 @@ no-follow, atomic, and flushed to disk before validation. The replacement is
 an atomic exchange that is reverted if another tool replaced the file in the
 meantime, and a durable transaction marker lets the next run finish or undo an
 edit that was interrupted before validation completed. Binding files over 4 MiB
-are refused. The scripts never consult `PATH`: `hyprctl` and `omarchy` are
-opened at their fixed `/usr/bin` locations, verified to be root-owned regular
-files, executed through that verified descriptor, and run with a deadline, an
-output cap, and an explicit allowlisted environment. The transaction journals
-each phase durably and re-checks that `bindings.lua` still names the published
-file before validation, plugin enabling, and commit. Pass `--yes` for
-non-interactive setup.
+are refused, and the scan for an older manual setup is bounded by depth, entry
+count, Lua file count, cumulative bytes, and elapsed time. Within a directory every
+Lua file is inspected before the scan descends into that directory's
+subdirectories. The walk is otherwise depth-first, so if one subtree exhausts a
+budget, a later sibling subtree is not reached and its contents are missing from
+the report. If any limit stops the scan, setup refuses to continue and says
+which limit it hit: an incomplete scan cannot show that no manual setup exists,
+and installing anyway would leave two sets of bindings behind. An incomplete
+report therefore costs detail in the error message, never a second setup.
+
+The scripts never resolve a command through the caller's `PATH`. They replace
+`PATH`, `CDPATH` and `IFS` before running anything external, and derive their
+own location with shell builtins rather than `dirname`. `hyprctl` and `omarchy`
+are opened at their fixed `/usr/bin` locations and verified as root-owned
+regular files in a root-owned directory; `hyprctl` is then executed through that
+verified descriptor, and `omarchy` by its verified path, because it locates its
+own subcommands relative to that path. Both run with a deadline, an output cap,
+and an explicit allowlisted environment.
+
+The transaction journals each phase durably and re-checks that `bindings.lua`
+still names the published file before validation, plugin enabling, and commit.
+After an interrupted run, recovery restores the binding file it owns but never
+changes the plugin's enabled state: a crash cannot establish who last changed
+it, so the state is reported instead. Pass `--yes` for non-interactive setup.
+
+Setup refuses a Hyprland config directory or `bindings.lua` that is not owned by
+you, or that is writable by group or other, because the transaction relies on
+advisory locks and on no second writer outside your control.
+
+Both scripts also unset `LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH` and the
+other loader variables before starting anything, so no command they run inherits
+them, including `/usr/bin/env` itself, whose own environment `env -i` cannot
+change.
+
+Scope: the dynamic loader acts before the first line of either script, so a
+library already preloaded into the launching shell cannot be unmapped from
+inside the process it affects. The test suite measures exactly that with a real
+preloaded library: it must appear in the launching shell and in nothing else.
+Anyone who can set those variables in your environment can already run code as
+you.
 
 The test suite (`tests/setup.sh`) runs inside an unprivileged user namespace
 and binds a mock `/usr/bin` over the real one, so it needs `unshare` with user
-namespaces enabled.
+namespaces enabled. A C compiler is optional; when present the suite builds a
+real preloaded library to measure the environment boundary.
 
 For transaction safety, guided setup refuses a symlinked Hyprland config
 directory or `bindings.lua`. If your dotfiles use symlinks, point

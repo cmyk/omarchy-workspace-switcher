@@ -6,6 +6,7 @@ between validation and exchange, and process death at every phase of the
 transaction followed by recovery on the next run.
 """
 
+import errno
 import hashlib
 import importlib.util
 import json
@@ -55,18 +56,41 @@ class Case:
         self.target = os.path.join(self.hypr, "bindings.lua")
         with open(self.target, "wb") as handle:
             handle.write(ORIGINAL)
+        self.state = os.path.join(self.dir, "plugin-enabled")
         self.set_enabled(enabled)
         self.write_mock("hyprctl", "")
-
-    def set_enabled(self, enabled):
+        # The mock keeps real plugin state on disk, so a test can assert what
+        # the state actually is after a crash and a recovery rather than
+        # inferring it from the command log.
         self.write_mock(
             "omarchy",
-            f"""
+            """
+            state="$XDG_CONFIG_HOME/../plugin-enabled"
             if [[ $* == 'plugin list --json' ]]; then
-              printf '[{{"id":"reomarchy.workspace-switcher","enabled":{str(enabled).lower()}}}]\\n'
+              printf '[{"id":"reomarchy.workspace-switcher","enabled":%s}]\\n' "$(cat "$state")"
+            elif [[ $* == 'plugin enable reomarchy.workspace-switcher' ]]; then
+              [[ -e "$XDG_CONFIG_HOME/../enable-blocks" ]] && {
+                printf 'true' > "$state"
+                printf '%s' "$$" > "$XDG_CONFIG_HOME/../enable-pid"
+                : > "$XDG_CONFIG_HOME/../enable-entered"
+                # exec keeps this PID, so the test can kill exactly this
+                # process instead of matching on a command line.
+                exec sleep 300
+              }
+              printf 'true' > "$state"
+            elif [[ $* == 'plugin disable reomarchy.workspace-switcher' ]]; then
+              printf 'false' > "$state"
             fi
             """,
         )
+
+    def set_enabled(self, enabled):
+        with open(self.state, "w") as handle:
+            handle.write("true" if enabled else "false")
+
+    def enabled(self):
+        with open(self.state) as handle:
+            return handle.read().strip() == "true"
 
     def write_mock(self, name, body):
         path = os.path.join(self.mock, name)
@@ -87,6 +111,13 @@ class Case:
     def read_target(self):
         with open(self.target, "rb") as handle:
             return handle.read()
+
+    def marker_phase(self):
+        path = os.path.join(self.hypr, ".workspace-switcher-transaction.json")
+        if not os.path.exists(path):
+            return None
+        with open(path) as handle:
+            return json.load(handle).get("phase")
 
     def marker_exists(self):
         return os.path.exists(os.path.join(self.hypr, ".workspace-switcher-transaction.json"))
@@ -212,11 +243,11 @@ def test_concurrent_replace(root):
 
 
 CRASH_POINTS = [
-    ("after-backup", "create_backup"),
-    ("after-marker", "write_marker"),
-    ("after-replace", "replace_target"),
-    ("after-validate", "validate_hyprland"),
-    ("after-enable", "enable_plugin"),
+    ("after-backup", "after:create_backup"),
+    ("after-marker", "after:write_marker"),
+    ("after-replace", "after:replace_target"),
+    ("after-validate", "after:validate_hyprland"),
+    ("after-enable", "after:enable_plugin"),
 ]
 
 CRASH_DRIVER = """
@@ -224,28 +255,36 @@ import importlib.util, os, sys
 spec = importlib.util.spec_from_file_location("bt", sys.argv[1])
 bt = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bt)
-name = sys.argv[2]
+mode, name = sys.argv[2].split(":", 1)
 real = getattr(bt, name)
 def crash(*args, **kwargs):
-    result = real(*args, **kwargs)
+    if mode == "before":
+        os._exit(137)
+    real(*args, **kwargs)
     os._exit(137)
 setattr(bt, name, crash)
 bt.transact("install", sys.argv[3])
 """
 
 
+def crash_at(case, spec):
+    """Run an install that dies at one point, and return the process result."""
+    return subprocess.run(
+        ["/usr/bin/python3", "-I", "-c", CRASH_DRIVER, HELPER, spec, case.hypr],
+        capture_output=True,
+        text=True,
+        env=case.env(),
+    )
+
+
 def test_crash_recovery(root):
     module = load_helper()
     for label, function in CRASH_POINTS:
         case = Case(root, f"crash-{label}", enabled=False)
-        result = subprocess.run(
-            ["/usr/bin/python3", "-I", "-c", CRASH_DRIVER, HELPER, function, case.hypr],
-            capture_output=True,
-            text=True,
-            env=case.env(),
-        )
+        result = crash_at(case, function)
         expect(result.returncode == 137, f"{label}: driver did not crash ({result.stderr})")
         marker_path = os.path.join(case.hypr, ".workspace-switcher-transaction.json")
+        function = function.split(":", 1)[1]
         if function in ("create_backup",):
             expect(not os.path.exists(marker_path), f"{label}: marker present before it was written")
             expect(case.read_target() == ORIGINAL, f"{label}: target changed before marker")
@@ -266,10 +305,12 @@ def test_crash_recovery(root):
         expect(not os.path.exists(marker_path), f"{label}: marker not cleared after recovery")
         expect(not case.temp_files(), f"{label}: staging files left after recovery")
         log = case.logged()
+        # Recovery never undoes plugin state: a crash cannot establish who last
+        # changed it. It restores the file it owns and reports the rest.
+        expect("plugin disable" not in log, f"{label}: recovery changed plugin state")
         if function == "enable_plugin":
-            expect("plugin disable" in log, f"{label}: plugin state not restored on recovery")
-        else:
-            expect("plugin disable" not in log, f"{label}: plugin disabled although enable was never reached")
+            expect(case.enabled(), f"{label}: recovery disabled a plugin it did not own")
+            expect("plugin state was left unchanged" in recovery.stderr, f"{label}: no plugin-state notice")
         if function in ("replace_target", "validate_hyprland", "enable_plugin"):
             expect("reload" in log[len(log_before):], f"{label}: Hyprland not reloaded after restore")
         backups = [n for n in os.listdir(case.hypr) if ".bak.workspace-switcher-install." in n]
@@ -318,27 +359,264 @@ def test_replace_after_exchange(root):
         expect(case.read_target() == intruder, f"{stage}: recovery touched the foreign file")
 
 
-def test_independent_enable_after_crash(root):
-    """A crash before replacement, then the user enables the plugin themselves.
-    Recovery must not undo that enable."""
-    case = Case(root, "independent-enable", enabled=False)
-    result = subprocess.run(
-        ["/usr/bin/python3", "-I", "-c", CRASH_DRIVER, HELPER, "write_marker", case.hypr],
-        capture_output=True,
-        text=True,
+def test_enable_window(root):
+    """Every state around the plugin enable call, with an independent enable.
+
+    The marker phase "enabling" is written before the call is issued, so it can
+    never prove the transaction caused the change. Recovery must therefore
+    leave plugin state alone in all of these, and only report it.
+    """
+    module = load_helper()
+
+    # 1. Killed after the phase write but before the call was issued; the user
+    #    then enables the plugin themselves.
+    case = Case(root, "enable-window-before-call", enabled=False)
+    expect(crash_at(case, "before:enable_plugin").returncode == 137, "before-call: no crash")
+    expect(case.marker_phase() == "enabling", f"before-call: phase was {case.marker_phase()}")
+    expect(not case.enabled(), "before-call: plugin enabled although the call never ran")
+    case.set_enabled(True)
+    recovery = case.run_helper("check")
+    expect(recovery.returncode == 0, f"before-call: recovery failed: {recovery.stderr}")
+    expect(case.enabled(), "before-call: recovery undid an independent enable")
+    expect("plugin disable" not in case.logged(), "before-call: recovery issued a disable")
+    expect(case.read_target() == ORIGINAL, "before-call: file not restored")
+
+    # 2. Killed after the call returned but before the "enabled" phase write.
+    case = Case(root, "enable-window-after-return", enabled=False)
+    expect(crash_at(case, "after:enable_plugin").returncode == 137, "after-return: no crash")
+    expect(case.marker_phase() == "enabling", f"after-return: phase was {case.marker_phase()}")
+    expect(case.enabled(), "after-return: enable did not take effect")
+    recovery = case.run_helper("check")
+    expect(recovery.returncode == 0, f"after-return: recovery failed: {recovery.stderr}")
+    expect(case.enabled(), "after-return: recovery disabled the plugin")
+    expect("plugin state was left unchanged" in recovery.stderr, "after-return: no notice")
+    expect(case.read_target() == ORIGINAL, "after-return: file not restored")
+
+    # 3. Killed while the call was running, after it had already taken effect.
+    case = Case(root, "enable-window-during-call", enabled=False)
+    entered = os.path.join(case.dir, "enable-entered")
+    open(os.path.join(case.dir, "enable-blocks"), "w").close()
+    process = subprocess.Popen(
+        ["/usr/bin/python3", "-I", HELPER, "install", case.hypr],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         env=case.env(),
     )
-    expect(result.returncode == 137, f"driver did not crash ({result.stderr})")
-    expect(case.marker_exists(), "marker missing after crash")
-    expect(case.read_target() == ORIGINAL, "target changed before replacement")
-    # The user enables the plugin independently.
-    case.set_enabled(True)
-    log_before = case.logged()
+    try:
+        deadline = time.monotonic() + 30
+        while not os.path.exists(entered):
+            expect(time.monotonic() < deadline, "during-call: enable was never entered")
+            expect(process.poll() is None, "during-call: helper exited early")
+            time.sleep(0.05)
+        process.kill()
+    finally:
+        process.wait(timeout=30)
+    os.remove(os.path.join(case.dir, "enable-blocks"))
+    # The blocked mock is in its own session, so killing the helper does not
+    # reach it. It recorded its own pid, which stays valid across its exec.
+    with open(os.path.join(case.dir, "enable-pid")) as handle:
+        blocked_pid = int(handle.read())
+    try:
+        os.kill(blocked_pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    expect(case.marker_phase() == "enabling", f"during-call: phase was {case.marker_phase()}")
+    expect(case.enabled(), "during-call: enable did not take effect before the kill")
     recovery = case.run_helper("check")
-    expect(recovery.returncode == 0, f"recovery failed: {recovery.stderr}")
-    expect("plugin disable" not in case.logged()[len(log_before):], "recovery undid an independent enable")
-    expect(not case.marker_exists(), "marker not cleared")
-    expect(case.read_target() == ORIGINAL, "target changed by recovery")
+    expect(recovery.returncode == 0, f"during-call: recovery failed: {recovery.stderr}")
+    expect(case.enabled(), "during-call: recovery disabled the plugin")
+    expect(case.read_target() == ORIGINAL, "during-call: file not restored")
+
+    # 4. Killed before the file was ever replaced, then an independent enable.
+    case = Case(root, "enable-window-concurrent", enabled=False)
+    expect(crash_at(case, "after:write_marker").returncode == 137, "concurrent: no crash")
+    expect(case.marker_phase() == "staged", f"concurrent: phase was {case.marker_phase()}")
+    case.set_enabled(True)
+    recovery = case.run_helper("check")
+    expect(recovery.returncode == 0, f"concurrent: recovery failed: {recovery.stderr}")
+    expect(case.enabled(), "concurrent: recovery undid an independent enable")
+    expect("plugin disable" not in case.logged(), "concurrent: recovery issued a disable")
+    expect("plugin state was left unchanged" not in recovery.stderr,
+           "concurrent: reported plugin state although the call was never reached")
+    expect(case.read_target() == ORIGINAL, "concurrent: file changed")
+
+
+def test_unrevertable_concurrent_replace(root):
+    """The concurrent-replace revert itself fails.
+
+    The switcher content is live and the other program's file is parked at the
+    staging name. Nothing may be deleted, the marker must survive, and the next
+    run must restore the recorded original from the durable backup.
+    """
+    module_probe = load_helper()
+    case = Case(root, "unrevertable-replace", enabled=False)
+    intruder = b"-- Concurrent edit that must not be destroyed\n"
+
+    def patch(module):
+        real_current = module.current_target_matches
+        real_exchange = module.exchange_names
+        state = {"exchanges": 0}
+
+        def race(directory_fd, expected_stat):
+            real_current(directory_fd, expected_stat)
+            temp = case.target + ".other"
+            with open(temp, "wb") as handle:
+                handle.write(intruder)
+            os.replace(temp, case.target)
+
+        def failing_exchange(directory_fd, first, second):
+            state["exchanges"] += 1
+            if state["exchanges"] == 1:
+                return real_exchange(directory_fd, first, second)
+            raise OSError(errno.EBUSY, "synthetic revert failure", first)
+
+        module.current_target_matches = race
+        module.exchange_names = failing_exchange
+
+    module, error = in_process(case, "install", patch)
+    expect(error and "could not be undone" in error, f"unreverted exchange not reported: {error}")
+    expect(case.read_target() == installed_contents(module), "switcher content is not live as reported")
+    expect(case.marker_exists(), "marker cleared although the edit is live")
+
+    parked = case.temp_files()
+    expect(len(parked) == 1, f"expected the other program's file to be parked, found {parked}")
+    with open(os.path.join(case.hypr, parked[0]), "rb") as handle:
+        expect(handle.read() == intruder, "the other program's content was not preserved")
+    expect(parked[0] in error, "the error does not name the parked file")
+
+    # The next run restores the recorded original from the durable backup.
+    recovery = case.run_helper("check")
+    expect(recovery.returncode == 0, f"recovery after an unreverted exchange failed: {recovery.stderr}")
+    expect(recovery.stdout.strip() == "absent", f"state after recovery was {recovery.stdout!r}")
+    expect(case.read_target() == ORIGINAL, "recovery did not restore the recorded original")
+    expect(not case.marker_exists(), "marker not cleared after recovery")
+    with open(os.path.join(case.hypr, parked[0]), "rb") as handle:
+        expect(handle.read() == intruder, "recovery destroyed the other program's file")
+
+
+def test_scan_bounds(root):
+    """A wide, deep, heavy tree must not cost unbounded entries, memory or fds.
+
+    Every directory entry counts toward the budget, not only the Lua files that
+    are opened, and descriptors are released as each subtree finishes.
+    """
+    module = load_helper()
+    case = Case(root, "scan-bounds")
+    hypr = case.hypr
+
+    # Wide: many non-Lua entries and many directories, none of which are
+    # matches, so nothing but the entry budget can stop the walk.
+    wide = os.path.join(hypr, "wide")
+    os.makedirs(wide)
+    for index in range(4000):
+        open(os.path.join(wide, f"file{index}.conf"), "w").close()
+    for index in range(400):
+        os.makedirs(os.path.join(wide, f"dir{index}"))
+
+    # Heavy: enough large Lua files to exceed the cumulative byte budget if it
+    # were only enforced per file.
+    heavy = os.path.join(hypr, "heavy")
+    os.makedirs(heavy)
+    payload = b"-" * (1024 * 1024)
+    for index in range(64):
+        with open(os.path.join(heavy, f"big{index}.lua"), "wb") as handle:
+            handle.write(payload)
+
+    open_directories = 0
+    peak_directories = 0
+    real_open = os.open
+    real_close = os.close
+    tracked = set()
+
+    def counting_open(*args, **kwargs):
+        nonlocal open_directories, peak_directories
+        file_fd = real_open(*args, **kwargs)
+        if kwargs.get("flags", args[1] if len(args) > 1 else 0) & os.O_DIRECTORY:
+            tracked.add(file_fd)
+            open_directories += 1
+            peak_directories = max(peak_directories, open_directories)
+        return file_fd
+
+    def counting_close(file_fd):
+        nonlocal open_directories
+        if file_fd in tracked:
+            tracked.discard(file_fd)
+            open_directories -= 1
+        return real_close(file_fd)
+
+    directory_fd = module.open_directory(hypr)
+    os.open = counting_open
+    os.close = counting_close
+    started = time.monotonic()
+    try:
+        matches, truncated, limit = module.scan_manual_setup(directory_fd)
+    finally:
+        os.open = real_open
+        os.close = real_close
+        real_close(directory_fd)
+    elapsed = time.monotonic() - started
+
+    expect(truncated, "wide tree did not report a truncated scan")
+    expect(elapsed < module.SCAN_MAX_SECONDS + 10, f"scan took {elapsed:.1f}s")
+    expect(
+        peak_directories <= module.SCAN_MAX_DEPTH + 1,
+        f"scan held {peak_directories} directory descriptors at once",
+    )
+    expect(open_directories == 0, f"scan leaked {open_directories} directory descriptors")
+    expect(limit is not None, "truncated scan did not record which limit was hit")
+
+    # Depth is its own boundary, checked on a small tree so no other budget can
+    # end the walk first.
+    case = Case(root, "scan-depth")
+    deep = case.hypr
+    for level in range(module.SCAN_MAX_DEPTH + 2):
+        deep = os.path.join(deep, f"d{level}")
+    os.makedirs(deep)
+    with open(os.path.join(deep, "too-deep.lua"), "w") as handle:
+        handle.write(module.PLUGIN_ID)
+    directory_fd = module.open_directory(case.hypr)
+    try:
+        matches, truncated, limit = module.scan_manual_setup(directory_fd)
+    finally:
+        real_close(directory_fd)
+    expect(matches == [], f"scan descended past the depth limit: {matches}")
+    expect(truncated and "nested deeper" in (limit or ""), f"depth limit not reported: {limit}")
+
+    # Files at a given depth are inspected before any subtree can spend the
+    # remaining budget, so a shallow manual setup is not missed because a large
+    # sibling directory happened to be read first.
+    case = Case(root, "scan-order")
+    with open(os.path.join(case.hypr, "manual.lua"), "w") as handle:
+        handle.write(module.PLUGIN_ID)
+    crowd = os.path.join(case.hypr, "crowd")
+    os.makedirs(crowd)
+    for index in range(module.SCAN_MAX_ENTRIES + 500):
+        open(os.path.join(crowd, f"f{index}.conf"), "w").close()
+    directory_fd = module.open_directory(case.hypr)
+    try:
+        matches, truncated, limit = module.scan_manual_setup(directory_fd)
+    finally:
+        real_close(directory_fd)
+    expect("manual.lua" in matches, f"shallow manual setup missed behind a wide directory: {matches}")
+    expect(truncated, "crowded tree did not report truncation")
+
+    # A match inside the budget is still found, and the scan stays no-follow.
+    case = Case(root, "scan-finds-match")
+    nested = os.path.join(case.hypr, "conf.d")
+    os.makedirs(nested)
+    with open(os.path.join(nested, "old.lua"), "w") as handle:
+        handle.write(module.PLUGIN_ID)
+    outside = os.path.join(case.dir, "outside.lua")
+    with open(outside, "w") as handle:
+        handle.write(module.PLUGIN_ID)
+    os.symlink(outside, os.path.join(case.hypr, "linked.lua"))
+    directory_fd = module.open_directory(case.hypr)
+    try:
+        matches, truncated, limit = module.scan_manual_setup(directory_fd)
+    finally:
+        real_close(directory_fd)
+    expect(matches == ["conf.d/old.lua"], f"unexpected matches: {matches}")
+    expect(not truncated and limit is None, f"small tree reported truncation: {limit}")
 
 
 def test_tampered_marker(root):
@@ -389,7 +667,9 @@ def main():
         test_concurrent_replace(root)
         test_crash_recovery(root)
         test_replace_after_exchange(root)
-        test_independent_enable_after_crash(root)
+        test_enable_window(root)
+        test_unrevertable_concurrent_replace(root)
+        test_scan_bounds(root)
         test_tampered_marker(root)
     print("transaction tests: pass")
 
