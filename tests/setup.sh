@@ -16,13 +16,25 @@ mkdir -p "$mock_bin"
 cat > "$mock_bin/omarchy" <<'MOCK'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$MOCK_LOG"
+if [[ $* == 'plugin list --json' ]]; then
+  printf '[{"id":"reomarchy.workspace-switcher","enabled":%s}]\n' "${MOCK_PLUGIN_ENABLED:-true}"
+elif [[ $* == 'plugin enable reomarchy.workspace-switcher' && ${MOCK_ENABLE_FAIL:-0} == 1 ]]; then
+  printf '%s\n' 'synthetic enable failure' >&2
+  exit 1
+elif [[ $* == 'plugin enable reomarchy.workspace-switcher' ]]; then
+  printf '%s\n' 'Enabled reomarchy.workspace-switcher'
+fi
 MOCK
 
 cat > "$mock_bin/hyprctl" <<'MOCK'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$MOCK_LOG"
 if [[ ${1:-} == configerrors && -n ${MOCK_CONFIG_ERRORS:-} ]]; then
-  printf '%s\n' "$MOCK_CONFIG_ERRORS"
+  error_marker="${MOCK_LOG}.config-error-returned"
+  if [[ ! -e $error_marker ]]; then
+    printf '%s\n' "$MOCK_CONFIG_ERRORS"
+    : > "$error_marker"
+  fi
 fi
 MOCK
 
@@ -43,15 +55,23 @@ run_install() {
     XDG_CONFIG_HOME="$case_dir/config" \
     MOCK_LOG="$case_dir/commands.log" \
     MOCK_CONFIG_ERRORS="${2:-}" \
+    MOCK_PLUGIN_ENABLED="${3:-true}" \
+    MOCK_ENABLE_FAIL="${4:-0}" \
     "$repo_dir/install.sh" --yes
 }
 
 case_dir=$(new_case success)
+original_bindings="$case_dir/original-bindings.lua"
+cp -- "$case_dir/config/hypr/bindings.lua" "$original_bindings"
+chmod 0640 "$case_dir/config/hypr/bindings.lua"
 run_install "$case_dir"
 bindings="$case_dir/config/hypr/bindings.lua"
 [[ $(grep -Fc -- '-- Workspace Switcher: begin' "$bindings") == 1 ]] || fail "installer did not add one marker block"
 grep -Fq -- '/omarchy/plugins/reomarchy.workspace-switcher/bindings.lua' "$bindings" || fail "loader path missing"
-find "$case_dir/config/hypr" -maxdepth 1 -name 'bindings.lua.bak.workspace-switcher.*' | grep -q . || fail "install backup missing"
+backup=$(find "$case_dir/config/hypr" -maxdepth 1 -name 'bindings.lua.bak.workspace-switcher-install.*' -print -quit)
+[[ -n $backup ]] || fail "install backup missing"
+cmp -s -- "$original_bindings" "$backup" || fail "install backup does not match the original"
+[[ $(stat -c '%a' "$bindings") == 640 ]] || fail "installer did not preserve binding file mode"
 if command -v luac >/dev/null 2>&1; then luac -p "$bindings"; fi
 
 run_install "$case_dir"
@@ -72,6 +92,19 @@ if run_install "$case_dir" 'synthetic config error'; then
 fi
 restored=$(sha256sum "$case_dir/config/hypr/bindings.lua" | cut -d' ' -f1)
 [[ $original == "$restored" ]] || fail "installer did not roll back a rejected change"
+
+case_dir=$(new_case enable-rollback)
+original=$(sha256sum "$case_dir/config/hypr/bindings.lua" | cut -d' ' -f1)
+if run_install "$case_dir" '' false 1; then
+  fail "installer accepted a plugin enable failure"
+fi
+restored=$(sha256sum "$case_dir/config/hypr/bindings.lua" | cut -d' ' -f1)
+[[ $original == "$restored" ]] || fail "installer did not roll back after plugin enable failure"
+grep -Fq -- 'plugin disable reomarchy.workspace-switcher' "$case_dir/commands.log" || fail "installer did not restore disabled plugin state"
+
+case_dir=$(new_case enable-disabled)
+run_install "$case_dir" '' false
+grep -Fq -- 'plugin enable reomarchy.workspace-switcher' "$case_dir/commands.log" || fail "installer did not enable a previously disabled plugin"
 
 case_dir=$(new_case manual)
 printf '%s\n' 'hl.exec_cmd("omarchy-shell shell summon reomarchy.workspace-switcher")' > "$case_dir/config/hypr/old-setup.lua"
@@ -116,5 +149,55 @@ if env PATH="$mock_bin:$PATH" \
 fi
 unchanged=$(sha256sum "$bindings" | cut -d' ' -f1)
 [[ $original == "$unchanged" ]] || fail "uninstaller changed a file with nested markers"
+
+case_dir=$(new_case truncated-install)
+bindings="$case_dir/config/hypr/bindings.lua"
+printf '%s\n' '-- Workspace Switcher: begin' >> "$bindings"
+original=$(sha256sum "$bindings" | cut -d' ' -f1)
+if run_install "$case_dir"; then
+  fail "installer accepted a truncated managed block"
+fi
+unchanged=$(sha256sum "$bindings" | cut -d' ' -f1)
+[[ $original == "$unchanged" ]] || fail "installer changed a file with a truncated block"
+
+case_dir=$(new_case altered-block)
+bindings="$case_dir/config/hypr/bindings.lua"
+cat >> "$bindings" <<'LUA'
+-- Workspace Switcher: begin
+-- unexpected content
+-- Workspace Switcher: end
+LUA
+original=$(sha256sum "$bindings" | cut -d' ' -f1)
+if run_install "$case_dir"; then
+  fail "installer accepted an altered managed block"
+fi
+unchanged=$(sha256sum "$bindings" | cut -d' ' -f1)
+[[ $original == "$unchanged" ]] || fail "installer changed a file with an altered block"
+
+case_dir=$(new_case symlink-target)
+bindings="$case_dir/config/hypr/bindings.lua"
+victim="$case_dir/victim.lua"
+printf '%s\n' '-- Content outside Hyprland config' > "$victim"
+rm -- "$bindings"
+ln -s -- "$victim" "$bindings"
+original=$(sha256sum "$victim" | cut -d' ' -f1)
+if run_install "$case_dir"; then
+  fail "installer followed a symlinked binding file"
+fi
+unchanged=$(sha256sum "$victim" | cut -d' ' -f1)
+[[ $original == "$unchanged" ]] || fail "installer changed a symlink target"
+
+case_dir=$(new_case symlink-directory)
+mv -- "$case_dir/config/hypr" "$case_dir/config/real-hypr"
+ln -s -- "$case_dir/config/real-hypr" "$case_dir/config/hypr"
+bindings="$case_dir/config/real-hypr/bindings.lua"
+original=$(sha256sum "$bindings" | cut -d' ' -f1)
+if run_install "$case_dir"; then
+  fail "installer followed a symlinked Hyprland config directory"
+fi
+unchanged=$(sha256sum "$bindings" | cut -d' ' -f1)
+[[ $original == "$unchanged" ]] || fail "installer changed a file through a symlinked directory"
+
+! grep -Eq -- 'hl\.(un)?bind\("SUPER \+ mouse' "$repo_dir/bindings.lua" || fail "runtime bindings still replace Super+mouse mappings"
 
 printf 'setup tests: pass\n'

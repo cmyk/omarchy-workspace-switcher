@@ -6,15 +6,8 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
 hypr_dir="$config_home/hypr"
 bindings_file="$hypr_dir/bindings.lua"
-begin_marker="-- Workspace Switcher: begin"
-end_marker="-- Workspace Switcher: end"
+transaction_helper="$script_dir/binding_transaction.py"
 assume_yes=0
-temp_file=""
-
-cleanup() {
-  if [[ -n $temp_file && -f $temp_file ]]; then rm -f -- "$temp_file"; fi
-}
-trap cleanup EXIT
 
 fail() {
   printf 'workspace-switcher setup: %s\n' "$*" >&2
@@ -47,15 +40,16 @@ while (( $# > 0 )); do
 done
 
 [[ -f $script_dir/manifest.json ]] || fail "manifest.json is missing beside this script"
+[[ -x $transaction_helper ]] || fail "binding transaction helper is missing or not executable"
 [[ $(jq -r '.id // empty' "$script_dir/manifest.json") == "$plugin_id" ]] ||
   fail "this script is not inside the $plugin_id plugin"
 [[ -d $hypr_dir ]] || fail "Hyprland config directory not found: $hypr_dir"
-[[ -f $bindings_file ]] || fail "Hyprland bindings file not found: $bindings_file"
-[[ ! -L $bindings_file ]] || fail "refusing to replace symlinked bindings file: $bindings_file"
-
-if grep -Fq -- "$begin_marker" "$bindings_file"; then
+binding_state=$(
+  "$transaction_helper" check "$hypr_dir"
+) || fail "could not validate the existing binding block"
+if [[ $binding_state == installed ]]; then
+  "$transaction_helper" install "$hypr_dir" >/dev/null || fail "could not enable the existing installation"
   printf 'Workspace Switcher bindings are already installed in %s.\n' "$bindings_file"
-  omarchy plugin enable "$plugin_id"
   exit 0
 fi
 
@@ -76,47 +70,11 @@ printf '%s\n' \
   "It will add a marked loader block to $bindings_file and keep a backup."
 confirm "Install the Workspace Switcher bindings?" || fail "cancelled"
 
-omarchy plugin enable "$plugin_id"
-
-backup=$(mktemp "${bindings_file}.bak.workspace-switcher.XXXXXXXX")
-cp -p -- "$bindings_file" "$backup"
-
-temp_file=$(mktemp "$hypr_dir/.workspace-switcher-bindings.XXXXXX")
-cp -- "$bindings_file" "$temp_file"
-cat >> "$temp_file" <<'LUA'
-
--- Workspace Switcher: begin
-do
-  local config_home = os.getenv("XDG_CONFIG_HOME") or (os.getenv("HOME") .. "/.config")
-  local path = config_home .. "/omarchy/plugins/reomarchy.workspace-switcher/bindings.lua"
-  local file = io.open(path, "r")
-  if file then
-    file:close()
-    dofile(path)
-  end
-end
--- Workspace Switcher: end
-LUA
-chmod --reference="$bindings_file" "$temp_file"
-mv -- "$temp_file" "$bindings_file"
-temp_file=""
-
-if ! hyprctl reload >/dev/null; then
-  cp -p -- "$backup" "$bindings_file"
-  hyprctl reload >/dev/null || true
-  fail "Hyprland reload failed; restored $bindings_file from $backup"
-fi
-if ! config_errors=$(hyprctl configerrors 2>&1); then
-  cp -p -- "$backup" "$bindings_file"
-  hyprctl reload >/dev/null || true
-  fail "could not validate Hyprland; restored $bindings_file from $backup"
-fi
-if [[ $config_errors =~ [^[:space:]] ]]; then
-  cp -p -- "$backup" "$bindings_file"
-  hyprctl reload >/dev/null || true
-  printf '%s\n' "$config_errors" >&2
-  fail "Hyprland rejected the change; restored $bindings_file from $backup"
-fi
+transaction_result=$(
+  "$transaction_helper" install "$hypr_dir"
+) || fail "binding transaction failed"
+IFS=$'\t' read -r transaction_status backup <<< "$transaction_result"
+[[ $transaction_status == changed && -n ${backup:-} ]] || fail "unexpected binding transaction result"
 
 printf 'Workspace Switcher bindings installed. Backup: %s\n' "$backup"
 printf 'Press Super+Tab to use the switcher.\n'
