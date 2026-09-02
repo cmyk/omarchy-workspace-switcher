@@ -2,19 +2,26 @@
 """Safely install or remove the Workspace Switcher Hyprland loader block."""
 
 import argparse
+import ctypes
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import secrets
+import selectors
+import shutil
 import signal
 import stat
 import subprocess
 import sys
+import time
 
 
 PLUGIN_ID = "reomarchy.workspace-switcher"
 TARGET_NAME = "bindings.lua"
+MARKER_NAME = ".workspace-switcher-transaction.json"
+TEMP_PREFIX = ".workspace-switcher-bindings."
 BEGIN_MARKER = b"-- Workspace Switcher: begin"
 END_MARKER = b"-- Workspace Switcher: end"
 MANAGED_BLOCK = b"""-- Workspace Switcher: begin
@@ -30,6 +37,19 @@ end
 -- Workspace Switcher: end
 """
 
+# Resource bounds. A Hyprland binding file is hand-written configuration; a
+# file beyond these limits is refused before it is materialized in memory.
+MAX_TARGET_BYTES = 4 * 1024 * 1024
+MAX_TARGET_LINES = 100_000
+MAX_MARKER_BYTES = 64 * 1024
+MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024
+COMMAND_TIMEOUTS = {
+    "hyprctl": 20.0,
+    "omarchy": 60.0,
+}
+TERMINATE_GRACE_SECONDS = 2.0
+RENAME_EXCHANGE = 1 << 1
+
 
 class TransactionError(Exception):
     pass
@@ -41,6 +61,114 @@ def fail(message):
 
 def nofollow_flags():
     return getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+
+
+# --- trusted executables and bounded subprocesses ---------------------------
+
+
+def resolve_executable(name):
+    found = shutil.which(name)
+    if found is None:
+        fail(f"required command not found: {name}")
+    path = os.path.realpath(found)
+    try:
+        info = os.stat(path)
+    except OSError as error:
+        fail(f"cannot inspect {name} at {path}: {error}")
+    if not stat.S_ISREG(info.st_mode) or not info.st_mode & 0o111:
+        fail(f"refusing non-executable {name} at {path}")
+    if info.st_uid not in (0, os.geteuid()):
+        fail(f"refusing {name} at {path}: owned by an untrusted user")
+    if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        fail(f"refusing {name} at {path}: writable by other users")
+    return path
+
+
+def terminate_process_tree(process):
+    for signal_number, grace in ((signal.SIGTERM, TERMINATE_GRACE_SECONDS), (signal.SIGKILL, None)):
+        try:
+            os.killpg(process.pid, signal_number)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=grace)
+            break
+        except subprocess.TimeoutExpired:
+            continue
+    # The leader is reaped; sweep any remaining members of its process group.
+    for _ in range(50):
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+
+
+def run_command(executable, arguments, timeout):
+    argv = [executable, *arguments]
+    try:
+        process = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except OSError as error:
+        fail(f"cannot run {os.path.basename(executable)}: {error}")
+
+    outputs = {process.stdout: bytearray(), process.stderr: bytearray()}
+    deadline = time.monotonic() + timeout
+    description = " ".join([os.path.basename(executable), *arguments])
+    selector = selectors.DefaultSelector()
+    for stream in outputs:
+        selector.register(stream, selectors.EVENT_READ)
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                fail(f"{description} did not finish within {timeout:.0f}s")
+            for key, _ in selector.select(remaining):
+                chunk = os.read(key.fd, 65536)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                buffer = outputs[key.fileobj]
+                buffer.extend(chunk)
+                if len(buffer) > MAX_COMMAND_OUTPUT_BYTES:
+                    fail(f"{description} produced more than {MAX_COMMAND_OUTPUT_BYTES} bytes of output")
+        remaining = max(deadline - time.monotonic(), 0)
+        try:
+            returncode = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            fail(f"{description} did not exit within {timeout:.0f}s")
+    except BaseException:
+        terminate_process_tree(process)
+        raise
+    finally:
+        selector.close()
+        process.stdout.close()
+        process.stderr.close()
+
+    stdout = bytes(outputs[process.stdout]).decode(errors="replace")
+    stderr = bytes(outputs[process.stderr]).decode(errors="replace")
+    return returncode, stdout, stderr
+
+
+class Commands:
+    def __init__(self):
+        self.hyprctl = resolve_executable("hyprctl")
+        self.omarchy = resolve_executable("omarchy")
+
+    def run_hyprctl(self, *arguments):
+        return run_command(self.hyprctl, arguments, COMMAND_TIMEOUTS["hyprctl"])
+
+    def run_omarchy(self, *arguments):
+        return run_command(self.omarchy, arguments, COMMAND_TIMEOUTS["omarchy"])
+
+
+# --- descriptor-relative file access ---------------------------------------
 
 
 def open_directory(path):
@@ -63,12 +191,16 @@ def lock_descriptor(file_fd, description):
         fail(f"cannot lock {description}: {error}")
 
 
-def read_all(file_fd):
+def read_bounded(file_fd, limit, description):
     chunks = []
+    total = 0
     while True:
-        chunk = os.read(file_fd, 1024 * 1024)
+        chunk = os.read(file_fd, min(1024 * 1024, limit + 1 - total))
         if not chunk:
             return b"".join(chunks)
+        total += len(chunk)
+        if total > limit:
+            fail(f"{description} is larger than {limit} bytes; refusing to process it")
         chunks.append(chunk)
 
 
@@ -85,34 +217,47 @@ def target_signature(file_stat):
     )
 
 
-def open_target(directory_fd):
+def open_regular(directory_fd, name, limit, description, missing_ok=False):
     try:
-        file_fd = os.open(
-            TARGET_NAME, os.O_RDONLY | nofollow_flags(), dir_fd=directory_fd
-        )
+        file_fd = os.open(name, os.O_RDONLY | nofollow_flags(), dir_fd=directory_fd)
     except OSError as error:
+        if missing_ok and error.errno == errno.ENOENT:
+            return None
         if error.errno == errno.ELOOP:
             fail(
-                f"refusing symlinked {TARGET_NAME}; replace it with a regular "
+                f"refusing symlinked {name}; replace it with a regular "
                 "file or configure the loader manually"
             )
-        fail(f"cannot securely open {TARGET_NAME}: {error}")
-
-    file_stat_before = os.fstat(file_fd)
-    if not stat.S_ISREG(file_stat_before.st_mode):
+        fail(f"cannot securely open {name}: {error}")
+    try:
+        file_stat_before = os.fstat(file_fd)
+        if not stat.S_ISREG(file_stat_before.st_mode):
+            fail(f"refusing non-regular {description}: {name}")
+        if file_stat_before.st_size > limit:
+            fail(f"{description} is larger than {limit} bytes; refusing to process it")
+        lock_descriptor(file_fd, name)
+        contents = read_bounded(file_fd, limit, description)
+        file_stat_after = os.fstat(file_fd)
+        if target_signature(file_stat_before) != target_signature(file_stat_after):
+            fail(f"{name} changed while it was being read")
+    except BaseException:
         os.close(file_fd)
-        fail(f"refusing non-regular binding file: {TARGET_NAME}")
-    lock_descriptor(file_fd, TARGET_NAME)
-    contents = read_all(file_fd)
-    file_stat_after = os.fstat(file_fd)
-    if target_signature(file_stat_before) != target_signature(file_stat_after):
-        os.close(file_fd)
-        fail(f"{TARGET_NAME} changed while it was being read")
+        raise
     return file_fd, file_stat_after, contents
 
 
+def open_target(directory_fd):
+    return open_regular(directory_fd, TARGET_NAME, MAX_TARGET_BYTES, "binding file")
+
+
+def split_lines(contents):
+    if contents.count(b"\n") > MAX_TARGET_LINES:
+        fail(f"binding file has more than {MAX_TARGET_LINES} lines; refusing to process it")
+    return contents.splitlines(keepends=True)
+
+
 def managed_block_state(contents):
-    lines = contents.splitlines(keepends=True)
+    lines = split_lines(contents)
     begin_lines = [
         index for index, line in enumerate(lines) if line.rstrip(b"\r\n") == BEGIN_MARKER
     ]
@@ -178,97 +323,222 @@ def create_backup(directory_fd, contents, mode, action):
     return backup_name
 
 
-def replace_target(directory_fd, expected_stat, contents, mode):
-    temp_name, temp_fd = create_unique(
-        directory_fd, ".workspace-switcher-bindings.", mode
+def unlink_quietly(directory_fd, name):
+    try:
+        os.unlink(name, dir_fd=directory_fd)
+    except FileNotFoundError:
+        pass
+
+
+_libc = None
+
+
+def exchange_names(directory_fd, first, second):
+    """Atomically swap two directory entries with renameat2(RENAME_EXCHANGE)."""
+    global _libc
+    if _libc is None:
+        try:
+            _libc = ctypes.CDLL(None, use_errno=True)
+            _libc.renameat2.argtypes = (
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            )
+            _libc.renameat2.restype = ctypes.c_int
+        except (OSError, AttributeError) as error:
+            fail(f"renameat2 is unavailable; cannot perform an atomic exchange: {error}")
+    result = _libc.renameat2(
+        directory_fd,
+        os.fsencode(first),
+        directory_fd,
+        os.fsencode(second),
+        RENAME_EXCHANGE,
     )
-    renamed = False
+    if result != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code), first)
+
+
+def replace_target(directory_fd, expected_stat, contents, mode):
+    """Replace bindings.lua only if it is still the validated inode.
+
+    The staged file is exchanged with the target atomically. After the
+    exchange the previous target inode sits at the staging name, so its
+    identity is checked against the expected signature; if another writer
+    replaced the target in the meantime the exchange is reverted and the
+    transaction fails without discarding their file.
+    """
+    temp_name, temp_fd = create_unique(directory_fd, TEMP_PREFIX, mode)
+    exchanged = False
     try:
         os.fchmod(temp_fd, mode)
         write_durable(temp_fd, contents)
         current_target_matches(directory_fd, expected_stat)
-        os.replace(
-            temp_name,
-            TARGET_NAME,
-            src_dir_fd=directory_fd,
-            dst_dir_fd=directory_fd,
-        )
-        renamed = True
+        exchange_names(directory_fd, temp_name, TARGET_NAME)
+        exchanged = True
+        displaced = os.stat(temp_name, dir_fd=directory_fd, follow_symlinks=False)
+        # An exchange updates ctime on both inodes; compare the immutable identity
+        # and content-bearing fields instead.
+        expected_identity = target_signature(expected_stat)[:7]
+        if target_signature(displaced)[:7] != expected_identity:
+            exchange_names(directory_fd, temp_name, TARGET_NAME)
+            exchanged = False
+            fail(f"{TARGET_NAME} was replaced concurrently; the concurrent edit was kept")
+        os.fsync(directory_fd)
+        unlink_quietly(directory_fd, temp_name)
+        os.fsync(directory_fd)
         return temp_fd, os.fstat(temp_fd)
     except BaseException:
         os.close(temp_fd)
-        if not renamed:
-            try:
-                os.unlink(temp_name, dir_fd=directory_fd)
-            except FileNotFoundError:
-                pass
+        if not exchanged:
+            unlink_quietly(directory_fd, temp_name)
         raise
 
 
-def validate_hyprland():
-    reload_result = subprocess.run(
-        ["hyprctl", "reload"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+# --- transaction marker and recovery ---------------------------------------
+
+
+def digest(contents):
+    return hashlib.sha256(contents).hexdigest()
+
+
+def write_marker(directory_fd, record):
+    payload = json.dumps(record, sort_keys=True).encode()
+    temp_name, temp_fd = create_unique(directory_fd, MARKER_NAME + ".", 0o600)
+    try:
+        write_durable(temp_fd, payload)
+    finally:
+        os.close(temp_fd)
+    try:
+        os.replace(temp_name, MARKER_NAME, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+    except BaseException:
+        unlink_quietly(directory_fd, temp_name)
+        raise
+    os.fsync(directory_fd)
+
+
+def clear_marker(directory_fd):
+    unlink_quietly(directory_fd, MARKER_NAME)
+    os.fsync(directory_fd)
+
+
+def read_marker(directory_fd):
+    opened = open_regular(
+        directory_fd, MARKER_NAME, MAX_MARKER_BYTES, "transaction marker", missing_ok=True
     )
-    if reload_result.returncode != 0:
+    if opened is None:
+        return None
+    marker_fd, _, payload = opened
+    os.close(marker_fd)
+    try:
+        record = json.loads(payload)
+    except json.JSONDecodeError as error:
+        fail(f"transaction marker {MARKER_NAME} is unreadable ({error}); resolve it manually")
+    required = {"action", "backup", "original_sha256", "new_sha256", "mode", "previously_enabled"}
+    if not isinstance(record, dict) or not required <= set(record):
+        fail(f"transaction marker {MARKER_NAME} is incomplete; resolve it manually")
+    if os.sep in str(record["backup"]) or not str(record["backup"]).startswith(TARGET_NAME + ".bak."):
+        fail(f"transaction marker {MARKER_NAME} names an unexpected backup; resolve it manually")
+    return record
+
+
+def recover(directory_fd, hyprland_directory, commands):
+    """Finish or undo a transaction that died before it was validated."""
+    record = read_marker(directory_fd)
+    if record is None:
+        return
+    target_fd, target_stat, contents = open_target(directory_fd)
+    try:
+        current_sha = digest(contents)
+        if current_sha == record["original_sha256"]:
+            pass
+        elif current_sha == record["new_sha256"]:
+            backup_fd, _, backup_contents = open_regular(
+                directory_fd, record["backup"], MAX_TARGET_BYTES, "transaction backup"
+            )
+            os.close(backup_fd)
+            if digest(backup_contents) != record["original_sha256"]:
+                fail(
+                    f"interrupted transaction found, but backup {record['backup']} does not "
+                    f"match the recorded original; resolve {MARKER_NAME} manually"
+                )
+            mode = int(record["mode"])
+            restored_fd, _ = replace_target(directory_fd, target_stat, backup_contents, mode)
+            os.close(restored_fd)
+            validate_hyprland(commands)
+        else:
+            fail(
+                f"interrupted transaction found, but {TARGET_NAME} matches neither the original "
+                f"nor the staged content; backup: "
+                f"{os.path.join(hyprland_directory, record['backup'])}; remove {MARKER_NAME} "
+                "after resolving it manually"
+            )
+        if record["action"] == "install" and record["previously_enabled"] is False:
+            restore_disabled_plugin_state(commands)
+    finally:
+        os.close(target_fd)
+    clear_marker(directory_fd)
+    print(f"recovered\t{os.path.join(hyprland_directory, record['backup'])}", file=sys.stderr)
+
+
+# --- Hyprland and plugin state ---------------------------------------------
+
+
+def validate_hyprland(commands):
+    returncode, _, _ = commands.run_hyprctl("reload")
+    if returncode != 0:
         fail("Hyprland reload failed")
 
-    errors = subprocess.run(
-        ["hyprctl", "configerrors"], capture_output=True, text=True
-    )
-    if errors.returncode != 0:
+    returncode, stdout, stderr = commands.run_hyprctl("configerrors")
+    if returncode != 0:
         fail("could not validate Hyprland configuration")
-    if errors.stdout.strip() or errors.stderr.strip():
-        detail = (errors.stdout + errors.stderr).strip()
+    if stdout.strip() or stderr.strip():
+        detail = (stdout + stderr).strip()
         fail(f"Hyprland rejected the change: {detail}")
 
 
-def plugin_is_enabled():
-    result = subprocess.run(
-        ["omarchy", "plugin", "list", "--json"], capture_output=True, text=True
-    )
-    if result.returncode != 0:
+def plugin_is_enabled(commands):
+    returncode, stdout, _ = commands.run_omarchy("plugin", "list", "--json")
+    if returncode != 0:
         fail("could not read the plugin's enabled state")
     try:
-        plugins = json.loads(result.stdout)
+        plugins = json.loads(stdout)
     except json.JSONDecodeError as error:
         fail(f"could not parse the plugin's enabled state: {error}")
+    if not isinstance(plugins, list):
+        fail("could not parse the plugin's enabled state: expected a list")
     for plugin in plugins:
-        if plugin.get("id") == PLUGIN_ID:
+        if isinstance(plugin, dict) and plugin.get("id") == PLUGIN_ID:
             return plugin.get("enabled") is True
     fail(f"plugin {PLUGIN_ID} is not known; rescan plugins and try again")
 
 
-def enable_plugin(previously_enabled):
+def enable_plugin(commands, previously_enabled):
     if previously_enabled:
         return
-    result = subprocess.run(
-        ["omarchy", "plugin", "enable", PLUGIN_ID], capture_output=True, text=True
-    )
-    if result.returncode == 0:
+    returncode, stdout, stderr = commands.run_omarchy("plugin", "enable", PLUGIN_ID)
+    if returncode == 0:
         return
-    detail = (result.stdout + result.stderr).strip()
+    detail = (stdout + stderr).strip()
     suffix = f": {detail}" if detail else ""
     fail(f"could not enable the plugin{suffix}")
 
 
-def restore_disabled_plugin_state():
-    result = subprocess.run(
-        ["omarchy", "plugin", "disable", PLUGIN_ID],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    if result.returncode != 0:
+def restore_disabled_plugin_state(commands):
+    returncode, _, _ = commands.run_omarchy("plugin", "disable", PLUGIN_ID)
+    if returncode != 0:
         fail("could not restore the plugin's previous disabled state")
 
 
-def restored_contents(directory_fd, current_stat, original_contents, original_mode):
+def restored_contents(directory_fd, current_stat, original_contents, original_mode, commands):
     restored_fd, restored_stat = replace_target(
         directory_fd, current_stat, original_contents, original_mode
     )
     os.close(restored_fd)
-    os.fsync(directory_fd)
     try:
-        validate_hyprland()
+        validate_hyprland(commands)
     except TransactionError as error:
         fail(f"binding file was restored, but Hyprland reload failed: {error}")
     return restored_stat
@@ -278,14 +548,22 @@ def edited_contents(action, original_contents, lines, begin_index, end_index):
     if action == "install":
         separator = b"\n" if original_contents.endswith(b"\n") else b"\n\n"
         return original_contents + separator + MANAGED_BLOCK
+    # Drop the single blank separator that install adds before the block.
+    if begin_index > 0 and lines[begin_index - 1].strip() == b"":
+        begin_index -= 1
     return b"".join(lines[:begin_index] + lines[end_index + 1 :])
 
 
+# --- entry points -----------------------------------------------------------
+
+
 def check(hyprland_directory):
+    commands = Commands()
     directory_fd = open_directory(hyprland_directory)
     target_fd = None
     try:
         lock_descriptor(directory_fd, "Hyprland config directory")
+        recover(directory_fd, hyprland_directory, commands)
         target_fd, _, contents = open_target(directory_fd)
         state, _, _, _ = managed_block_state(contents)
         print(state)
@@ -296,23 +574,25 @@ def check(hyprland_directory):
 
 
 def transact(action, hyprland_directory):
+    commands = Commands()
     directory_fd = open_directory(hyprland_directory)
     target_fd = None
     replacement_fd = None
     enable_attempted = False
     try:
         lock_descriptor(directory_fd, "Hyprland config directory")
+        recover(directory_fd, hyprland_directory, commands)
         target_fd, original_stat, original_contents = open_target(directory_fd)
         state, lines, begin_index, end_index = managed_block_state(original_contents)
-        previously_enabled = plugin_is_enabled() if action == "install" else None
+        previously_enabled = plugin_is_enabled(commands) if action == "install" else None
 
         if action == "install" and state == "installed":
             if not previously_enabled:
                 try:
-                    enable_plugin(previously_enabled)
+                    enable_plugin(commands, previously_enabled)
                 except BaseException as enable_error:
                     try:
-                        restore_disabled_plugin_state()
+                        restore_disabled_plugin_state(commands)
                     except BaseException as state_error:
                         fail(
                             f"{enable_error}; plugin state rollback also failed: "
@@ -332,21 +612,36 @@ def transact(action, hyprland_directory):
         backup_name = create_backup(
             directory_fd, original_contents, original_mode, action
         )
-        replacement_fd, replacement_stat = replace_target(
-            directory_fd, original_stat, new_contents, original_mode
+        write_marker(
+            directory_fd,
+            {
+                "action": action,
+                "backup": backup_name,
+                "original_sha256": digest(original_contents),
+                "new_sha256": digest(new_contents),
+                "mode": original_mode,
+                "previously_enabled": previously_enabled,
+            },
         )
+        try:
+            replacement_fd, replacement_stat = replace_target(
+                directory_fd, original_stat, new_contents, original_mode
+            )
+        except BaseException:
+            # A refused or failed exchange never applied the edit; nothing to recover.
+            clear_marker(directory_fd)
+            raise
 
         try:
-            os.fsync(directory_fd)
-            validate_hyprland()
+            validate_hyprland(commands)
             if action == "install":
                 enable_attempted = not previously_enabled
-                enable_plugin(previously_enabled)
+                enable_plugin(commands, previously_enabled)
         except BaseException as error:
             plugin_rollback_error = None
             if enable_attempted:
                 try:
-                    restore_disabled_plugin_state()
+                    restore_disabled_plugin_state(commands)
                 except BaseException as state_error:
                     plugin_rollback_error = state_error
             try:
@@ -355,19 +650,23 @@ def transact(action, hyprland_directory):
                     replacement_stat,
                     original_contents,
                     original_mode,
+                    commands,
                 )
             except BaseException as rollback_error:
                 fail(
                     f"{error}; automatic rollback also failed: {rollback_error}; "
-                    f"durable backup: {os.path.join(hyprland_directory, backup_name)}"
+                    f"durable backup: {os.path.join(hyprland_directory, backup_name)}; "
+                    f"the next run will retry recovery from {MARKER_NAME}"
                 )
             if plugin_rollback_error is not None:
                 fail(
                     f"{error}; restored {TARGET_NAME}, but plugin state rollback failed: "
                     f"{plugin_rollback_error}"
                 )
+            clear_marker(directory_fd)
             fail(f"{error}; restored {TARGET_NAME} from the transaction copy")
 
+        clear_marker(directory_fd)
         print(f"changed\t{os.path.join(hyprland_directory, backup_name)}")
     finally:
         if replacement_fd is not None:

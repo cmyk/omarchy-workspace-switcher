@@ -40,8 +40,12 @@ The guided setup explains that it replaces Omarchy's immediate
 setup, asks for confirmation, backs up `~/.config/hypr/bindings.lua`, and adds
 only a marked loader block. It reloads Hyprland and rolls the change back if
 configuration validation or plugin enabling fails. The file update is locked,
-no-follow, atomic, and flushed to disk before validation. Pass `--yes` for
-non-interactive setup.
+no-follow, atomic, and flushed to disk before validation. The replacement is
+an atomic exchange that is reverted if another tool replaced the file in the
+meantime, and a durable transaction marker lets the next run finish or undo an
+edit that was interrupted before validation completed. Binding files over 4 MiB
+are refused, and `hyprctl`/`omarchy` are resolved to trusted executables and run
+with deadlines and output caps. Pass `--yes` for non-interactive setup.
 
 For transaction safety, guided setup refuses a symlinked Hyprland config
 directory or `bindings.lua`. If your dotfiles use symlinks, point
