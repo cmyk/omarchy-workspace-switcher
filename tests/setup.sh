@@ -23,6 +23,9 @@ elif [[ $* == 'plugin enable reomarchy.workspace-switcher' && ${MOCK_ENABLE_FAIL
   exit 1
 elif [[ $* == 'plugin enable reomarchy.workspace-switcher' ]]; then
   printf '%s\n' 'Enabled reomarchy.workspace-switcher'
+elif [[ $* == 'plugin disable reomarchy.workspace-switcher' && ${MOCK_DISABLE_FAIL:-0} == 1 ]]; then
+  printf '%s\n' 'synthetic disable failure' >&2
+  exit 1
 fi
 MOCK
 
@@ -57,6 +60,7 @@ run_install() {
     MOCK_CONFIG_ERRORS="${2:-}" \
     MOCK_PLUGIN_ENABLED="${3:-true}" \
     MOCK_ENABLE_FAIL="${4:-0}" \
+    MOCK_DISABLE_FAIL="${5:-0}" \
     "$repo_dir/install.sh" --yes
 }
 
@@ -101,6 +105,14 @@ fi
 restored=$(sha256sum "$case_dir/config/hypr/bindings.lua" | cut -d' ' -f1)
 [[ $original == "$restored" ]] || fail "installer did not roll back after plugin enable failure"
 grep -Fq -- 'plugin disable reomarchy.workspace-switcher' "$case_dir/commands.log" || fail "installer did not restore disabled plugin state"
+
+case_dir=$(new_case installed-enable-rollback-failure)
+run_install "$case_dir"
+if run_install "$case_dir" '' false 1 1 2> "$case_dir/error.log"; then
+  fail "already-installed path accepted an enable and rollback failure"
+fi
+grep -Fq -- 'could not enable the plugin: synthetic enable failure' "$case_dir/error.log" || fail "already-installed path masked the enable error"
+grep -Fq -- 'plugin state rollback also failed' "$case_dir/error.log" || fail "already-installed path masked the rollback error"
 
 case_dir=$(new_case enable-disabled)
 run_install "$case_dir" '' false
@@ -181,9 +193,10 @@ printf '%s\n' '-- Content outside Hyprland config' > "$victim"
 rm -- "$bindings"
 ln -s -- "$victim" "$bindings"
 original=$(sha256sum "$victim" | cut -d' ' -f1)
-if run_install "$case_dir"; then
+if run_install "$case_dir" 2> "$case_dir/error.log"; then
   fail "installer followed a symlinked binding file"
 fi
+grep -Fq -- 'refusing symlinked bindings.lua' "$case_dir/error.log" || fail "symlinked binding error lacks guidance"
 unchanged=$(sha256sum "$victim" | cut -d' ' -f1)
 [[ $original == "$unchanged" ]] || fail "installer changed a symlink target"
 
@@ -192,13 +205,18 @@ mv -- "$case_dir/config/hypr" "$case_dir/config/real-hypr"
 ln -s -- "$case_dir/config/real-hypr" "$case_dir/config/hypr"
 bindings="$case_dir/config/real-hypr/bindings.lua"
 original=$(sha256sum "$bindings" | cut -d' ' -f1)
-if run_install "$case_dir"; then
+if run_install "$case_dir" 2> "$case_dir/error.log"; then
   fail "installer followed a symlinked Hyprland config directory"
 fi
+grep -Fq -- 'refusing a symlinked Hyprland config directory' "$case_dir/error.log" || fail "symlinked directory error lacks guidance"
 unchanged=$(sha256sum "$bindings" | cut -d' ' -f1)
 [[ $original == "$unchanged" ]] || fail "installer changed a file through a symlinked directory"
 
 ! grep -Eq -- 'hl\.(un)?bind\("SUPER \+ mouse' "$repo_dir/bindings.lua" || fail "runtime bindings still replace Super+mouse mappings"
-lua "$repo_dir/tests/bindings.lua" "$repo_dir/bindings.lua"
+if command -v lua >/dev/null 2>&1; then
+  lua "$repo_dir/tests/bindings.lua" "$repo_dir/bindings.lua"
+else
+  printf 'binding tests: skipped (lua unavailable)\n'
+fi
 
 printf 'setup tests: pass\n'

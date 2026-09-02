@@ -2,6 +2,7 @@
 """Safely install or remove the Workspace Switcher Hyprland loader block."""
 
 import argparse
+import errno
 import fcntl
 import json
 import os
@@ -47,6 +48,11 @@ def open_directory(path):
     try:
         return os.open(path, flags)
     except OSError as error:
+        if error.errno in (errno.ELOOP, errno.ENOTDIR):
+            fail(
+                "refusing a symlinked Hyprland config directory; point "
+                "XDG_CONFIG_HOME at the real config root before running setup"
+            )
         fail(f"cannot securely open Hyprland config directory {path}: {error}")
 
 
@@ -85,6 +91,11 @@ def open_target(directory_fd):
             TARGET_NAME, os.O_RDONLY | nofollow_flags(), dir_fd=directory_fd
         )
     except OSError as error:
+        if error.errno == errno.ELOOP:
+            fail(
+                f"refusing symlinked {TARGET_NAME}; replace it with a regular "
+                "file or configure the loader manually"
+            )
         fail(f"cannot securely open {TARGET_NAME}: {error}")
 
     file_stat_before = os.fstat(file_fd)
@@ -299,8 +310,14 @@ def transact(action, hyprland_directory):
             if not previously_enabled:
                 try:
                     enable_plugin(previously_enabled)
-                except BaseException:
-                    restore_disabled_plugin_state()
+                except BaseException as enable_error:
+                    try:
+                        restore_disabled_plugin_state()
+                    except BaseException as state_error:
+                        fail(
+                            f"{enable_error}; plugin state rollback also failed: "
+                            f"{state_error}"
+                        )
                     raise
             print("already-installed")
             return
