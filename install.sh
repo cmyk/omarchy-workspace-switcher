@@ -9,7 +9,11 @@
 # affect. Anyone who can set them in your environment can already run code as
 # you; see the README.
 PATH=/usr/bin:/bin
-unset CDPATH
+# Dropping the loader variables here cannot unmap what is already loaded into
+# this shell, but it does keep them out of every process the script starts,
+# including /usr/bin/env itself, whose own environment `env -i` cannot change.
+unset LD_PRELOAD LD_AUDIT LD_LIBRARY_PATH LD_ORIGIN_PATH LD_DEBUG LD_DEBUG_OUTPUT
+unset CDPATH BASH_ENV ENV
 IFS=$' \t\n'
 set -euo pipefail
 
@@ -98,12 +102,17 @@ fi
 [[ $binding_state == absent ]] || fail "unexpected binding state '$binding_state'"
 
 manual_files=$(run_clean "$jq_bin" -r '.manual_setup[]' <<< "$report")
+scan_truncated=$(run_clean "$jq_bin" -r '.manual_setup_truncated' <<< "$report")
 if [[ -n $manual_files ]]; then
   printf 'An existing manual Workspace Switcher setup was found under %s:\n%s\n' "$hypr_dir" "$manual_files" >&2
-  if [[ $(run_clean "$jq_bin" -r '.manual_setup_truncated' <<< "$report") == true ]]; then
-    printf '(scan was capped; more files may match)\n' >&2
-  fi
+  [[ $scan_truncated == true ]] && printf '(scan was capped; more files may match)\n' >&2
   fail "remove the old binding block before running this installer"
+fi
+if [[ $scan_truncated == true ]]; then
+  # An incomplete scan cannot show that no manual setup exists, and installing
+  # anyway would add a second set of bindings beside an existing one.
+  scan_limit=$(run_clean "$jq_bin" -r '.manual_setup_limit // "its limits"' <<< "$report")
+  fail "the scan of $hypr_dir stopped because it found $scan_limit, so an existing manual setup cannot be ruled out; simplify the tree under $hypr_dir or configure the loader manually"
 fi
 
 super_tab=$(run_clean "$jq_bin" -r '.super_tab_lines[]' <<< "$report")

@@ -87,10 +87,10 @@ ENVIRONMENT_ALLOWLIST = (
 # Bounds for the manual-setup scan of the Hyprland config tree. Every directory
 # entry counts, not only the Lua files that are opened, and the walk stops at
 # the first budget that runs out.
-SCAN_MAX_DEPTH = 4
+SCAN_MAX_DEPTH = 8
 SCAN_MAX_ENTRIES = 5000
 SCAN_MAX_FILES = 2000
-SCAN_MAX_FILE_BYTES = 1024 * 1024
+SCAN_MAX_FILE_BYTES = MAX_TARGET_BYTES
 SCAN_MAX_TOTAL_BYTES = 32 * 1024 * 1024
 SCAN_MAX_SECONDS = 10.0
 SCAN_MAX_MATCHES = 20
@@ -99,6 +99,14 @@ SUPER_TAB_PATTERN = re.compile(rb"SUPER\s*\+\s*(SHIFT\s*\+\s*)?TAB", re.IGNORECA
 
 class TransactionError(Exception):
     pass
+
+
+class UnrevertedExchange(TransactionError):
+    """The staged file was published and the exchange could not be undone.
+
+    The edit is live, so the transaction marker must survive for the next run
+    to restore the original from the durable backup.
+    """
 
 
 def fail(message):
@@ -497,7 +505,19 @@ def replace_target(directory_fd, expected_stat, contents, mode):
         # and content-bearing fields instead.
         expected_identity = target_signature(expected_stat)[:7]
         if target_signature(displaced)[:7] != expected_identity:
-            exchange_names(directory_fd, temp_name, TARGET_NAME)
+            try:
+                exchange_names(directory_fd, temp_name, TARGET_NAME)
+            except OSError as revert_error:
+                # Undoing the exchange failed, so the switcher content is live
+                # and the other program's file is parked at the staging name.
+                # Say where it is and leave it alone; the caller keeps the
+                # marker so the next run restores the recorded original.
+                raise UnrevertedExchange(
+                    f"{TARGET_NAME} was replaced concurrently and the exchange could not be "
+                    f"undone ({revert_error}); {TARGET_NAME} currently holds the Workspace "
+                    f"Switcher content and the other program's file is kept as {temp_name}; "
+                    "the next run restores the original from the durable backup"
+                ) from revert_error
             exchanged = False
             fail(f"{TARGET_NAME} was replaced concurrently; the concurrent edit was kept")
         os.fsync(directory_fd)
@@ -729,16 +749,23 @@ class ScanBudget:
         self.total_bytes = 0
         self.deadline = time.monotonic() + SCAN_MAX_SECONDS
         self.truncated = False
+        self.limit = None
+
+    def stop(self, limit):
+        self.truncated = True
+        if self.limit is None:
+            self.limit = limit
+        return True
 
     def exhausted(self):
-        if (
-            self.entries >= SCAN_MAX_ENTRIES
-            or self.files >= SCAN_MAX_FILES
-            or self.total_bytes >= SCAN_MAX_TOTAL_BYTES
-            or time.monotonic() > self.deadline
-        ):
-            self.truncated = True
-            return True
+        if self.entries >= SCAN_MAX_ENTRIES:
+            return self.stop(f"more than {SCAN_MAX_ENTRIES} files and directories")
+        if self.files >= SCAN_MAX_FILES:
+            return self.stop(f"more than {SCAN_MAX_FILES} Lua files")
+        if self.total_bytes >= SCAN_MAX_TOTAL_BYTES:
+            return self.stop(f"more than {SCAN_MAX_TOTAL_BYTES} bytes of Lua files")
+        if time.monotonic() > self.deadline:
+            return self.stop(f"longer than {SCAN_MAX_SECONDS:.0f} seconds")
         return False
 
     def remaining_bytes(self):
@@ -757,9 +784,9 @@ def scan_lua_file(parent_fd, name, relative, budget, matches):
         budget.files += 1
         limit = budget.remaining_bytes()
         if info.st_size > limit:
-            # Too large to inspect within the remaining budget; report it as a
-            # file that was not cleared rather than silently skipping it.
-            budget.truncated = True
+            # Too large to inspect within the remaining budget. It is reported
+            # as unscanned rather than silently treated as clean.
+            budget.stop(f"a Lua file larger than {limit} bytes ({relative})")
             return
         contents = read_bounded(file_fd, limit, relative)
         budget.total_bytes += len(contents)
@@ -782,6 +809,7 @@ def scan_directory(parent_fd, prefix, depth, budget, matches):
         entries = os.scandir(parent_fd)
     except OSError:
         return
+    subdirectories = []
     with entries:
         for entry in entries:
             if budget.exhausted():
@@ -794,26 +822,33 @@ def scan_directory(parent_fd, prefix, depth, budget, matches):
                 is_file = entry.is_file(follow_symlinks=False)
             except OSError:
                 continue
-            relative = prefix + entry.name
             if is_directory:
                 if depth + 1 > SCAN_MAX_DEPTH:
-                    budget.truncated = True
+                    budget.stop(f"directories nested deeper than {SCAN_MAX_DEPTH} levels")
                     continue
-                try:
-                    child_fd = os.open(
-                        entry.name,
-                        os.O_RDONLY | os.O_DIRECTORY | nofollow_flags(),
-                        dir_fd=parent_fd,
-                    )
-                except OSError:
-                    continue
-                try:
-                    scan_directory(child_fd, relative + "/", depth + 1, budget, matches)
-                finally:
-                    os.close(child_fd)
+                # Only the name is kept, so a wide directory costs its entry
+                # budget and nothing more. Descending happens afterwards.
+                subdirectories.append(entry.name)
                 continue
             if is_file and entry.name.endswith(".lua"):
-                scan_lua_file(parent_fd, entry.name, relative, budget, matches)
+                scan_lua_file(parent_fd, entry.name, prefix + entry.name, budget, matches)
+
+    # Every file at this depth has been inspected before any subtree can spend
+    # the remaining budget, so a shallow manual setup is never missed because a
+    # large sibling directory happened to be read first.
+    for name in subdirectories:
+        if budget.exhausted():
+            return
+        try:
+            child_fd = os.open(
+                name, os.O_RDONLY | os.O_DIRECTORY | nofollow_flags(), dir_fd=parent_fd
+            )
+        except OSError:
+            continue
+        try:
+            scan_directory(child_fd, prefix + name + "/", depth + 1, budget, matches)
+        finally:
+            os.close(child_fd)
 
 
 def scan_manual_setup(directory_fd):
@@ -821,7 +856,7 @@ def scan_manual_setup(directory_fd):
     matches = []
     budget = ScanBudget()
     scan_directory(directory_fd, "", 0, budget, matches)
-    return sorted(matches), budget.truncated
+    return sorted(matches), budget.truncated, budget.limit
 
 
 def super_tab_lines(lines):
@@ -844,11 +879,12 @@ def inspect(hyprland_directory):
         recover(directory_fd, hyprland_directory, commands)
         target_fd, _, contents = open_target(directory_fd)
         state, lines, _, _ = managed_block_state(contents)
-        manual, truncated = scan_manual_setup(directory_fd)
+        manual, truncated, limit = scan_manual_setup(directory_fd)
         report = {
             "state": state,
             "manual_setup": manual,
             "manual_setup_truncated": truncated,
+            "manual_setup_limit": limit,
             "super_tab_lines": super_tab_lines(lines) if state == "absent" else [],
         }
         print(json.dumps(report))
@@ -927,6 +963,10 @@ def transact(action, hyprland_directory):
             replacement_fd, replacement_stat = replace_target(
                 directory_fd, original_stat, new_contents, original_mode
             )
+        except UnrevertedExchange:
+            # The edit is published and could not be undone, so the marker has
+            # to survive for the next run to restore the original.
+            raise
         except BaseException:
             # A refused or failed exchange never applied the edit; nothing to recover.
             clear_marker(directory_fd)

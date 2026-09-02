@@ -45,7 +45,12 @@ an atomic exchange that is reverted if another tool replaced the file in the
 meantime, and a durable transaction marker lets the next run finish or undo an
 edit that was interrupted before validation completed. Binding files over 4 MiB
 are refused, and the scan for an older manual setup is bounded by depth, entry
-count, cumulative bytes, and elapsed time.
+count, Lua file count, cumulative bytes, and elapsed time. Files at each level
+are inspected before the scan descends, so a shallow setup is never missed
+because a large sibling directory was read first. If any of those limits stops
+the scan, setup refuses to continue and says which one: an incomplete scan
+cannot show that no manual setup exists, and installing anyway would leave two
+sets of bindings behind.
 
 The scripts never resolve a command through the caller's `PATH`. They replace
 `PATH`, `CDPATH` and `IFS` before running anything external, and derive their
@@ -66,11 +71,17 @@ Setup refuses a Hyprland config directory or `bindings.lua` that is not owned by
 you, or that is writable by group or other, because the transaction relies on
 advisory locks and on no second writer outside your control.
 
-Scope: the dynamic loader acts before the first line of either script, so
-`LD_PRELOAD` and similar variables cannot be neutralized from inside the process
-they affect. The scripts scrub the environment they hand to every command they
-run, and the test suite verifies that with a real preloaded library, but anyone
-who can set those variables in your environment can already run code as you.
+Both scripts also unset `LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH` and the
+other loader variables before starting anything, so no command they run inherits
+them, including `/usr/bin/env` itself, whose own environment `env -i` cannot
+change.
+
+Scope: the dynamic loader acts before the first line of either script, so a
+library already preloaded into the launching shell cannot be unmapped from
+inside the process it affects. The test suite measures exactly that with a real
+preloaded library: it must appear in the launching shell and in nothing else.
+Anyone who can set those variables in your environment can already run code as
+you.
 
 The test suite (`tests/setup.sh`) runs inside an unprivileged user namespace
 and binds a mock `/usr/bin` over the real one, so it needs `unshare` with user

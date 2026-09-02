@@ -9,7 +9,11 @@
 # affect. Anyone who can set them in your environment can already run code as
 # you; see the README.
 PATH=/usr/bin:/bin
-unset CDPATH
+# Dropping the loader variables here cannot unmap what is already loaded into
+# this shell, but it does keep them out of every process the script starts,
+# including /usr/bin/env itself, whose own environment `env -i` cannot change.
+unset LD_PRELOAD LD_AUDIT LD_LIBRARY_PATH LD_ORIGIN_PATH LD_DEBUG LD_DEBUG_OUTPUT
+unset CDPATH BASH_ENV ENV
 IFS=$' \t\n'
 set -euo pipefail
 

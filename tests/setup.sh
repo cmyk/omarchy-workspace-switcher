@@ -200,24 +200,65 @@ fi
 grep -Fq -- 'old-setup.lua' "$case_dir/error.log" || fail "manual setup file was not named"
 ! grep -Fq -- '-- Workspace Switcher: begin' "$case_dir/config/hypr/bindings.lua" || fail "manual setup detection changed bindings"
 
+# A tree the scan cannot finish must block installation: an incomplete scan
+# cannot show that no manual setup exists, and installing anyway would add a
+# second set of bindings beside an existing one.
+case_dir=$(new_case scan-truncated)
+hypr="$case_dir/config/hypr"
+mkdir -p "$hypr/many"
+for i in $(seq 1 6000); do : > "$hypr/many/f$i.conf"; done
+original=$(sha256sum "$hypr/bindings.lua" | cut -d' ' -f1)
+start=$(date +%s)
+if run_install "$case_dir" 2> "$case_dir/error.log"; then
+  fail "installer proceeded after an incomplete scan"
+fi
+elapsed=$(( $(date +%s) - start ))
+(( elapsed < 60 )) || fail "bounded scan took ${elapsed}s"
+grep -Fq -- 'cannot be ruled out' "$case_dir/error.log" || fail "truncated scan error lacks guidance"
+unchanged=$(sha256sum "$hypr/bindings.lua" | cut -d' ' -f1)
+[[ $original == "$unchanged" ]] || fail "installer changed bindings after an incomplete scan"
+
+# A tree that fits inside the budget installs, and the scan neither follows
+# symlinks nor descends past its depth limit.
 case_dir=$(new_case scan-bounds)
 hypr="$case_dir/config/hypr"
 outside="$case_dir/outside"
-mkdir -p "$outside/deep" "$hypr/a/b/c/d/e"
+mkdir -p "$outside/deep" "$hypr/a/b"
 printf '%s\n' 'hl.exec_cmd("omarchy-shell shell summon reomarchy.workspace-switcher")' > "$outside/deep/linked-setup.lua"
 ln -s -- "$outside" "$hypr/linked-dir"
 ln -s -- "$outside/deep/linked-setup.lua" "$hypr/linked-file.lua"
-printf '%s\n' 'hl.exec_cmd("omarchy-shell shell summon reomarchy.workspace-switcher")' > "$hypr/a/b/c/d/e/too-deep.lua"
-head -c 4194305 /dev/zero | tr '\0' '-' > "$hypr/a/huge.lua"
-printf '%s\n' 'reomarchy.workspace-switcher' >> "$hypr/a/huge.lua"
-mkdir -p "$hypr/many"
-for i in $(seq 1 2100); do : > "$hypr/many/f$i.lua"; done
-start=$(date +%s)
 run_install "$case_dir" 2> "$case_dir/error.log"
-elapsed=$(( $(date +%s) - start ))
-(( elapsed < 30 )) || fail "bounded scan took ${elapsed}s"
 grep -Fq -- '-- Workspace Switcher: begin' "$hypr/bindings.lua" || fail "install refused despite no reachable manual setup"
 ! grep -Fq -- 'linked' "$case_dir/error.log" || fail "scan followed a symlink"
+
+# A manual setup nested past the depth limit cannot be ruled out, so the
+# installer refuses rather than adding a second set of bindings.
+case_dir=$(new_case scan-too-deep)
+hypr="$case_dir/config/hypr"
+deep="$hypr/d1/d2/d3/d4/d5/d6/d7/d8/d9"
+mkdir -p "$deep"
+printf '%s\n' 'hl.exec_cmd("omarchy-shell shell summon reomarchy.workspace-switcher")' > "$deep/too-deep.lua"
+original=$(sha256sum "$hypr/bindings.lua" | cut -d' ' -f1)
+if run_install "$case_dir" 2> "$case_dir/error.log"; then
+  fail "installer proceeded past an unscannable depth"
+fi
+grep -Fq -- 'nested deeper than' "$case_dir/error.log" || fail "depth limit error lacks the reason"
+unchanged=$(sha256sum "$hypr/bindings.lua" | cut -d' ' -f1)
+[[ $original == "$unchanged" ]] || fail "installer changed bindings after a depth-limited scan"
+
+# A Lua file well over a megabyte is still searched, so a manual setup hiding
+# in a large file is found rather than skipped.
+case_dir=$(new_case scan-large-file)
+hypr="$case_dir/config/hypr"
+{ head -c 2097152 /dev/zero | tr '\0' '-'; printf '\n%s\n' 'reomarchy.workspace-switcher'; } > "$hypr/big.lua"
+original=$(sha256sum "$hypr/bindings.lua" | cut -d' ' -f1)
+if run_install "$case_dir" 2> "$case_dir/error.log"; then
+  fail "installer missed a manual setup inside a large Lua file"
+fi
+grep -Fq -- 'big.lua' "$case_dir/error.log" || fail "large-file manual setup was not named"
+unchanged=$(sha256sum "$hypr/bindings.lua" | cut -d' ' -f1)
+[[ $original == "$unchanged" ]] || fail "installer changed bindings when a manual setup was present"
+
 
 case_dir=$(new_case scan-depth-hit)
 hypr="$case_dir/config/hypr"
@@ -275,7 +316,9 @@ if [[ -n ${CANARY_DIR:-} ]]; then
   grep -Fq -- '-- Workspace Switcher: begin' "$case_dir/config/hypr/bindings.lua" || fail "canary run did not install"
   [[ -s $canary_log ]] || fail "loader canary never loaded; the test proves nothing"
   grep -qx 'bash' "$canary_log" || fail "loader canary did not load into the launching shell"
-  for name in python3 jq hyprctl omarchy gum; do
+  [[ $(sort -u "$canary_log" | wc -l) == 1 ]] ||
+    fail "preloaded library reached a child process: $(sort -u "$canary_log" | tr '\n' ' ')"
+  for name in env python3 jq hyprctl omarchy gum; do
     ! grep -qx "$name" "$canary_log" || fail "preloaded library reached $name through the scrubbed environment"
   done
 fi

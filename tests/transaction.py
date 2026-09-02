@@ -6,6 +6,7 @@ between validation and exchange, and process death at every phase of the
 transaction followed by recovery on the next run.
 """
 
+import errno
 import hashlib
 import importlib.util
 import json
@@ -440,6 +441,59 @@ def test_enable_window(root):
     expect(case.read_target() == ORIGINAL, "concurrent: file changed")
 
 
+def test_unrevertable_concurrent_replace(root):
+    """The concurrent-replace revert itself fails.
+
+    The switcher content is live and the other program's file is parked at the
+    staging name. Nothing may be deleted, the marker must survive, and the next
+    run must restore the recorded original from the durable backup.
+    """
+    module_probe = load_helper()
+    case = Case(root, "unrevertable-replace", enabled=False)
+    intruder = b"-- Concurrent edit that must not be destroyed\n"
+
+    def patch(module):
+        real_current = module.current_target_matches
+        real_exchange = module.exchange_names
+        state = {"exchanges": 0}
+
+        def race(directory_fd, expected_stat):
+            real_current(directory_fd, expected_stat)
+            temp = case.target + ".other"
+            with open(temp, "wb") as handle:
+                handle.write(intruder)
+            os.replace(temp, case.target)
+
+        def failing_exchange(directory_fd, first, second):
+            state["exchanges"] += 1
+            if state["exchanges"] == 1:
+                return real_exchange(directory_fd, first, second)
+            raise OSError(errno.EBUSY, "synthetic revert failure", first)
+
+        module.current_target_matches = race
+        module.exchange_names = failing_exchange
+
+    module, error = in_process(case, "install", patch)
+    expect(error and "could not be undone" in error, f"unreverted exchange not reported: {error}")
+    expect(case.read_target() == installed_contents(module), "switcher content is not live as reported")
+    expect(case.marker_exists(), "marker cleared although the edit is live")
+
+    parked = case.temp_files()
+    expect(len(parked) == 1, f"expected the other program's file to be parked, found {parked}")
+    with open(os.path.join(case.hypr, parked[0]), "rb") as handle:
+        expect(handle.read() == intruder, "the other program's content was not preserved")
+    expect(parked[0] in error, "the error does not name the parked file")
+
+    # The next run restores the recorded original from the durable backup.
+    recovery = case.run_helper("check")
+    expect(recovery.returncode == 0, f"recovery after an unreverted exchange failed: {recovery.stderr}")
+    expect(recovery.stdout.strip() == "absent", f"state after recovery was {recovery.stdout!r}")
+    expect(case.read_target() == ORIGINAL, "recovery did not restore the recorded original")
+    expect(not case.marker_exists(), "marker not cleared after recovery")
+    with open(os.path.join(case.hypr, parked[0]), "rb") as handle:
+        expect(handle.read() == intruder, "recovery destroyed the other program's file")
+
+
 def test_scan_bounds(root):
     """A wide, deep, heavy tree must not cost unbounded entries, memory or fds.
 
@@ -458,12 +512,6 @@ def test_scan_bounds(root):
         open(os.path.join(wide, f"file{index}.conf"), "w").close()
     for index in range(400):
         os.makedirs(os.path.join(wide, f"dir{index}"))
-
-    # Deep: past the depth limit, so the match below must not be reached.
-    deep = os.path.join(hypr, "a", "b", "c", "d", "e")
-    os.makedirs(deep)
-    with open(os.path.join(deep, "too-deep.lua"), "w") as handle:
-        handle.write(module.PLUGIN_ID)
 
     # Heavy: enough large Lua files to exceed the cumulative byte budget if it
     # were only enforced per file.
@@ -501,7 +549,7 @@ def test_scan_bounds(root):
     os.close = counting_close
     started = time.monotonic()
     try:
-        matches, truncated = module.scan_manual_setup(directory_fd)
+        matches, truncated, limit = module.scan_manual_setup(directory_fd)
     finally:
         os.open = real_open
         os.close = real_close
@@ -515,10 +563,42 @@ def test_scan_bounds(root):
         f"scan held {peak_directories} directory descriptors at once",
     )
     expect(open_directories == 0, f"scan leaked {open_directories} directory descriptors")
-    expect(
-        all("too-deep" not in match for match in matches),
-        f"scan descended past the depth limit: {matches}",
-    )
+    expect(limit is not None, "truncated scan did not record which limit was hit")
+
+    # Depth is its own boundary, checked on a small tree so no other budget can
+    # end the walk first.
+    case = Case(root, "scan-depth")
+    deep = case.hypr
+    for level in range(module.SCAN_MAX_DEPTH + 2):
+        deep = os.path.join(deep, f"d{level}")
+    os.makedirs(deep)
+    with open(os.path.join(deep, "too-deep.lua"), "w") as handle:
+        handle.write(module.PLUGIN_ID)
+    directory_fd = module.open_directory(case.hypr)
+    try:
+        matches, truncated, limit = module.scan_manual_setup(directory_fd)
+    finally:
+        real_close(directory_fd)
+    expect(matches == [], f"scan descended past the depth limit: {matches}")
+    expect(truncated and "nested deeper" in (limit or ""), f"depth limit not reported: {limit}")
+
+    # Files at a given depth are inspected before any subtree can spend the
+    # remaining budget, so a shallow manual setup is not missed because a large
+    # sibling directory happened to be read first.
+    case = Case(root, "scan-order")
+    with open(os.path.join(case.hypr, "manual.lua"), "w") as handle:
+        handle.write(module.PLUGIN_ID)
+    crowd = os.path.join(case.hypr, "crowd")
+    os.makedirs(crowd)
+    for index in range(module.SCAN_MAX_ENTRIES + 500):
+        open(os.path.join(crowd, f"f{index}.conf"), "w").close()
+    directory_fd = module.open_directory(case.hypr)
+    try:
+        matches, truncated, limit = module.scan_manual_setup(directory_fd)
+    finally:
+        real_close(directory_fd)
+    expect("manual.lua" in matches, f"shallow manual setup missed behind a wide directory: {matches}")
+    expect(truncated, "crowded tree did not report truncation")
 
     # A match inside the budget is still found, and the scan stays no-follow.
     case = Case(root, "scan-finds-match")
@@ -532,11 +612,11 @@ def test_scan_bounds(root):
     os.symlink(outside, os.path.join(case.hypr, "linked.lua"))
     directory_fd = module.open_directory(case.hypr)
     try:
-        matches, truncated = module.scan_manual_setup(directory_fd)
+        matches, truncated, limit = module.scan_manual_setup(directory_fd)
     finally:
         real_close(directory_fd)
     expect(matches == ["conf.d/old.lua"], f"unexpected matches: {matches}")
-    expect(not truncated, "small tree reported truncation")
+    expect(not truncated and limit is None, f"small tree reported truncation: {limit}")
 
 
 def test_tampered_marker(root):
@@ -588,6 +668,7 @@ def main():
         test_crash_recovery(root)
         test_replace_after_exchange(root)
         test_enable_window(root)
+        test_unrevertable_concurrent_replace(root)
         test_scan_bounds(root)
         test_tampered_marker(root)
     print("transaction tests: pass")
