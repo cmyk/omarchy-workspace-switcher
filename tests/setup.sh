@@ -199,5 +199,7 @@ unchanged=$(sha256sum "$bindings" | cut -d' ' -f1)
 [[ $original == "$unchanged" ]] || fail "installer changed a file through a symlinked directory"
 
 ! grep -Eq -- 'hl\.(un)?bind\("SUPER \+ mouse' "$repo_dir/bindings.lua" || fail "runtime bindings still replace Super+mouse mappings"
+grep -Fq -- 'hl.dsp.submap(workspace_switcher_submap)' "$repo_dir/bindings.lua" || fail "runtime bindings do not isolate switcher input"
+grep -Fq -- 'release_watchdog = hl.timer' "$repo_dir/bindings.lua" || fail "runtime bindings have no missed-release cleanup"
 
 printf 'setup tests: pass\n'
