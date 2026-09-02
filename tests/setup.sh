@@ -199,5 +199,6 @@ unchanged=$(sha256sum "$bindings" | cut -d' ' -f1)
 [[ $original == "$unchanged" ]] || fail "installer changed a file through a symlinked directory"
 
 ! grep -Eq -- 'hl\.(un)?bind\("SUPER \+ mouse' "$repo_dir/bindings.lua" || fail "runtime bindings still replace Super+mouse mappings"
+lua "$repo_dir/tests/bindings.lua" "$repo_dir/bindings.lua"
 
 printf 'setup tests: pass\n'

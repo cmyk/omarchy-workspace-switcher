@@ -66,6 +66,19 @@ def read_all(file_fd):
         chunks.append(chunk)
 
 
+def target_signature(file_stat):
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        file_stat.st_mode,
+        file_stat.st_uid,
+        file_stat.st_gid,
+        file_stat.st_size,
+        file_stat.st_mtime_ns,
+        file_stat.st_ctime_ns,
+    )
+
+
 def open_target(directory_fd):
     try:
         file_fd = os.open(
@@ -74,12 +87,17 @@ def open_target(directory_fd):
     except OSError as error:
         fail(f"cannot securely open {TARGET_NAME}: {error}")
 
-    file_stat = os.fstat(file_fd)
-    if not stat.S_ISREG(file_stat.st_mode):
+    file_stat_before = os.fstat(file_fd)
+    if not stat.S_ISREG(file_stat_before.st_mode):
         os.close(file_fd)
         fail(f"refusing non-regular binding file: {TARGET_NAME}")
     lock_descriptor(file_fd, TARGET_NAME)
-    return file_fd, file_stat, read_all(file_fd)
+    contents = read_all(file_fd)
+    file_stat_after = os.fstat(file_fd)
+    if target_signature(file_stat_before) != target_signature(file_stat_after):
+        os.close(file_fd)
+        fail(f"{TARGET_NAME} changed while it was being read")
+    return file_fd, file_stat_after, contents
 
 
 def managed_block_state(contents):
@@ -111,7 +129,7 @@ def current_target_matches(directory_fd, expected_stat):
         fail(f"cannot revalidate {TARGET_NAME}: {error}")
     if not stat.S_ISREG(current.st_mode):
         fail(f"refusing changed non-regular binding file: {TARGET_NAME}")
-    if (current.st_dev, current.st_ino) != (expected_stat.st_dev, expected_stat.st_ino):
+    if target_signature(current) != target_signature(expected_stat):
         fail(f"{TARGET_NAME} changed during the transaction; refusing to overwrite it")
 
 
