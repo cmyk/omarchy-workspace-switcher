@@ -877,6 +877,32 @@ def super_tab_lines(lines):
     return found
 
 
+def probe(hyprland_directory):
+    """Read-only onboarding check: never recover journals or run commands."""
+    directory_fd = open_directory(hyprland_directory)
+    target_fd = None
+    try:
+        lock_descriptor(directory_fd, "Hyprland config directory")
+        try:
+            os.stat(MARKER_NAME, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            print("pending")
+            return
+        target_fd, _, contents = open_target(directory_fd)
+        state, _, _, _ = managed_block_state(contents)
+        if state == "installed":
+            print(state)
+            return
+        manual, truncated, _ = scan_manual_setup(directory_fd)
+        print("manual" if manual else "unknown" if truncated else "absent")
+    finally:
+        if target_fd is not None:
+            os.close(target_fd)
+        os.close(directory_fd)
+
+
 def inspect(hyprland_directory):
     commands = Commands()
     directory_fd = open_directory(hyprland_directory)
@@ -1046,7 +1072,7 @@ def transact(action, hyprland_directory):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("check", "inspect", "install", "remove"))
+    parser.add_argument("action", choices=("probe", "check", "inspect", "install", "remove"))
     parser.add_argument("hyprland_directory")
     args = parser.parse_args()
 
@@ -1057,7 +1083,9 @@ def main():
         if hasattr(signal, signal_name):
             signal.signal(getattr(signal, signal_name), interrupted)
 
-    if args.action == "check":
+    if args.action == "probe":
+        probe(args.hyprland_directory)
+    elif args.action == "check":
         check(args.hyprland_directory)
     elif args.action == "inspect":
         inspect(args.hyprland_directory)
