@@ -32,6 +32,22 @@ most recently used workspaces take priority.
 
 ```bash
 omarchy plugin add https://github.com/cmyk/omarchy-workspace-switcher.git --enable
+```
+
+On first load, the plugin checks for existing shortcut setup without modifying
+any files. If setup is missing, a prompt offers **Open guided setup**. This
+opens a terminal with the installer below; approve the shortcut changes there.
+No copying a second command is required. Errors stay visible in that terminal.
+The prompt gets out of the terminal's way and checks again when setup finishes.
+
+**Later** (or Escape) dismisses the prompt until the plugin next loads. Existing
+managed and recognised legacy manual setups are left alone. A failed or
+incomplete startup check offers guided setup, never an automatic repair.
+Until setup completes, the original Command/Super-Tab behaviour stays in place.
+
+You can still run setup manually when needed:
+
+```bash
 ~/.config/omarchy/plugins/reomarchy.workspace-switcher/install.sh
 ```
 

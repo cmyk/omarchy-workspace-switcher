@@ -10,6 +10,7 @@ Item {
   property var shell: null
   property var manifest: null
   property bool opened: false
+  SetupPrompt { id: setupPrompt }
   property bool revealed: false
   property bool quickSwitchPending: false
   property int selectedIndex: 0
@@ -263,6 +264,11 @@ Item {
   function open(payloadJson) {
     var payload = ({})
     try { payload = JSON.parse(payloadJson || "{}") } catch (e) { payload = ({}) }
+
+    if (payload.setup === true) {
+      setupPrompt.check()
+      return
+    }
 
     // Hyprland owns the global Command/Super binding, so it also reports the
     // modifier release. Ignore unrelated Command releases when the switcher

@@ -463,6 +463,7 @@ unchanged=$(sha256sum "$bindings" | cut -d' ' -f1)
 [[ $original == "$unchanged" ]] || fail "installer changed an oversized binding file"
 
 /usr/bin/python3 -I "$repo_dir/tests/transaction.py"
+/usr/bin/python3 -I "$repo_dir/tests/onboarding.py"
 
 ! grep -Eq -- 'hl\.(un)?bind\("SUPER \+ mouse' "$repo_dir/bindings.lua" || fail "runtime bindings still replace Super+mouse mappings"
 if command -v lua >/dev/null 2>&1; then
